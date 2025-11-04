@@ -210,6 +210,7 @@ class ConvPool(nn.Module):
            output features of query points: [B, C_out, 3]
         """
         dp, fj = self.grouper(query_xyz, support_xyz, features)
+        # print(f'fj shape: {fj.shape}, dp shape: {dp.shape}')
 
         neighbor_dim = 3
         if 'df' in self.feature_type or self.use_res:
@@ -283,4 +284,5 @@ class LocalAggregation(nn.Module):
         Returns:
            output features of query points: [B, C_out, 3]
         """
+        
         return self.SA_CONFIG_operator(query_xyz, support_xyz, support_features, query_idx)

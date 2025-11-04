@@ -146,3 +146,27 @@ dmypy.json
 wayne*
 semantic_kitti/shapenet/
 >>>>>>> 3121fefbc3691185d8132fd86100353f2aa32a71
+cpp/pointnet2_batch/*.run
+
+# artifacts
+*.pt
+*.pth
+*.onnx
+*.npz
+*.npy
+__pycache__/
+logs/
+outputs/
+checkpoints/
+cpp/pointnet2_batch/*.run
+
+# artifacts
+*.pt
+*.pth
+*.onnx
+*.npz
+*.npy
+__pycache__/
+logs/
+outputs/
+checkpoints/

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from ..build import MODELS
 from ..layers import create_convblock1d, create_convblock2d, create_act, CHANNEL_MAP, \
-    create_grouper, furthest_point_sample, random_sample, three_interpolation, get_aggregation_feautres
+    create_grouper, furthest_point_sample, random_sample, three_interpolation, get_aggregation_feautres, kdtree_sample
 
 
 def get_reduction_fn(reduction):
@@ -136,6 +136,33 @@ class SetAbstraction(nn.Module):
                 self.sample_fn = furthest_point_sample
             elif sampler.lower() == 'random':
                 self.sample_fn = random_sample
+            elif sampler.lower() == 'kdtree':
+                self.sample_fn = kdtree_sample
+            elif sampler.lower() == 'kdtree_adaptive':
+                # 使用自适应KDTree采样（如果可用）
+                try:
+                    from ..layers.kdsample import kdtree_adaptive_leaf_fps_sample
+                    self.sample_fn = lambda xyz, npoint: kdtree_adaptive_leaf_fps_sample(xyz, npoint, density_adaptive=True)
+                except ImportError:
+                    logging.warning("Adaptive KDTree sampler not available, falling back to standard KDTree")
+                    self.sample_fn = kdtree_sample
+            elif sampler.lower() == 'kdtree_simple':
+                try:
+                    from functools import partial
+                    from ..layers import kdtree_simple_sample
+                    sampler_args = kwargs.get('sampler_args', {}) or {}
+                    leaf_size = sampler_args.get('leaf_size', 32)
+                    strategy = sampler_args.get('strategy', 'random')  # random | uniform
+                    proportional = sampler_args.get('proportional', True)
+                    self.sample_fn = partial(kdtree_simple_sample,
+                                             leaf_size=leaf_size,
+                                             strategy=strategy,
+                                             proportional=proportional)
+                except ImportError:
+                    logging.warning("Simple KDTree sampler import failed, falling back to standard KDTree")
+                    self.sample_fn = kdtree_sample
+            else:
+                raise NotImplementedError(f"Sampler {sampler} not implemented")
 
     def forward(self, pf):
         p, f = pf

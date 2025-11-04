@@ -7,6 +7,14 @@ from torch.autograd import Function
 import math
 from openpoints.cpp.pointnet2_batch import pointnet2_cuda
 
+# 导入KDTree采样算法
+try:
+    from .kdsample import kdtree_leaf_fps_simple
+    KDTREE_AVAILABLE = True
+except ImportError:
+    KDTREE_AVAILABLE = False
+    print("Warning: KDTree sampling not available, sklearn not found")
+
 
 class BaseSampler(ABC):
     """If num_to_sample is provided, sample exactly
@@ -183,3 +191,23 @@ if __name__ == '__main__':
     print(query2.shape)
 
     print(torch.allclose(query1, query2))
+
+
+# KDTree采样接口
+def kdtree_sample(xyz, npoint):
+    """
+    KDTree叶节点FPS采样接口，兼容原有的fps接口
+    
+    Args:
+        xyz: (B, N, 3) - 输入点云
+        npoint: int - 采样点数
+    
+    Returns:
+        idx: (B, npoint) - 采样索引
+    """
+    if KDTREE_AVAILABLE:
+        return kdtree_leaf_fps_simple(xyz, npoint)
+    else:
+        # 回退到原始FPS
+        print("Warning: KDTree not available, falling back to FPS")
+        return furthest_point_sample(xyz, npoint)

@@ -349,6 +349,9 @@ def create_grouper(group_args):
             grouper = KNNGroup(nsample,  **group_args_copy)
     else:
         grouper = GroupAll()
+
+    print(f'Create grouper: {method}, radius: {radius}, nsample: {nsample}, args: {group_args_copy}')
+    # print(f'the size of grouper is :{grouper.shape}')
     return grouper
 
 

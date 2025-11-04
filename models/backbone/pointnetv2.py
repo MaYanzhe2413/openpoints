@@ -11,7 +11,7 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 import logging
-from ..layers import furthest_point_sample, random_sample,  LocalAggregation, three_interpolation, create_convblock1d # grid_subsampling,
+from ..layers import furthest_point_sample, random_sample, kdtree_sample, LocalAggregation, three_interpolation, create_convblock1d # grid_subsampling,
 from ..build import MODELS
 
 
@@ -49,6 +49,29 @@ class PointNetSAModuleMSG(nn.Module):
             self.sample_fn = furthest_point_sample
         elif 'random' in sampler.lower():
             self.sample_fn = random_sample
+        elif 'kdtree_simple' in sampler.lower():
+            # 简单KDTree叶节点随机/均匀采样，可通过 sampler_args 调整
+            try:
+                from functools import partial
+                from ..layers import kdtree_simple_sample, kdtree_sample
+                sampler_args = kwargs.get('sampler_args', {}) or {}
+                leaf_size = sampler_args.get('leaf_size', 32)
+                strategy = sampler_args.get('strategy', 'random')
+                proportional = sampler_args.get('proportional', True)
+                self.sample_fn = partial(kdtree_simple_sample,
+                                         leaf_size=leaf_size,
+                                         strategy=strategy,
+                                         proportional=proportional)
+            except ImportError:
+                logging.warning("Simple KDTree sampler import failed, falling back to standard KDTree")
+                from ..layers import kdtree_sample
+                self.sample_fn = kdtree_sample
+        elif 'kdtree' in sampler.lower():
+            self.sample_fn = kdtree_sample
+        else:
+            # 默认使用FPS
+            print(f"Unknown sampler '{sampler}', defaulting to FPS")
+            self.sample_fn = furthest_point_sample
 
         # holder for the grouper and convs (MLPs, \etc)
         self.local_aggregations = nn.ModuleList()
