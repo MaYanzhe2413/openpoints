@@ -6,6 +6,8 @@ Reference: https://github.com/Strawberry-Eat-Mango/PCT_Pytorch
 """
 
 from pickle import FALSE
+from typing import Optional, Dict, Any
+from ..build import MODELS
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,8 +29,11 @@ class Local_op(nn.Module):
         x, _ = torch.max(x, -1, keepdim=False)
         return x
 
+@MODELS.register_module()
 class Pct(nn.Module):
-    def __init__(self, output_channels=40, dropout=0.5):
+    def __init__(self, output_channels=40, dropout=0.5,
+                 subsample: str = 'fps', sampler_args: Optional[Dict[str, Any]] = None,
+                 in_channels: int = 3, **kwargs):
         super(Pct, self).__init__()
         self.conv1 = nn.Conv1d(3, 64, kernel_size=1, bias=False)
         self.conv2 = nn.Conv1d(64, 64, kernel_size=1, bias=False)
@@ -51,9 +56,10 @@ class Pct(nn.Module):
         self.bn7 = nn.BatchNorm1d(256)
         self.dp2 = nn.Dropout(p=dropout)
         self.linear3 = nn.Linear(256, output_channels)
-        # TODO: subsample layer. 
-        self.subsample1 = SubsampleGroup(512, 32, group='knn')        
-        self.subsample2 = SubsampleGroup(256, 32, group='knn')        
+        # Subsample layers (support fps, random, kdtree_simple)
+        sampler_args = sampler_args or {}
+        self.subsample1 = SubsampleGroup(512, 32, subsample=subsample, group='knn', sampler_args=sampler_args)
+        self.subsample2 = SubsampleGroup(256, 32, subsample=subsample, group='knn', sampler_args=sampler_args)
 
     def forward(self, xyz, x):
         batch_size, _, _ = x.size()
@@ -61,11 +67,14 @@ class Pct(nn.Module):
         x = F.relu(self.bn1(self.conv1(x)))
         # B, D, N
         x = F.relu(self.bn2(self.conv2(x)))
-        
-        # Embedding layer.
-        new_xyz, new_feature = self.subsample1(xyz, x)         
+        # Embedding layers with grouping
+        grouped_p, center_p, fj, center_x = self.subsample1(xyz, x)
+        center_expand = center_x.expand(-1, -1, -1, fj.shape[-1])
+        new_feature = torch.cat([fj - center_expand, center_expand], dim=1)  # (B, 2C, npoint, nsample)
         feature_0 = self.gather_local_0(new_feature)
-        new_xyz, new_feature = self.subsample2(new_xyz, feature_0) 
+        grouped_p, center_p, fj, center_x = self.subsample2(center_p, feature_0)
+        center_expand = center_x.expand(-1, -1, -1, fj.shape[-1])
+        new_feature = torch.cat([fj - center_expand, center_expand], dim=1)  # (B, 2C, npoint, nsample)
         feature_1 = self.gather_local_1(new_feature)
 
         # Transformer block.
@@ -80,6 +89,15 @@ class Pct(nn.Module):
         x = self.linear3(x)
 
         return x
+
+    def forward_cls_feat(self, xyz, x=None):
+        if hasattr(xyz, 'keys'):
+            x = xyz.get('x', None)
+            xyz = xyz['pos']
+        if x is None:
+            # fallback: use coordinates as features
+            x = xyz.transpose(1, 2).contiguous()
+        return self.forward(xyz, x)
 
 class Point_Transformer_Last(nn.Module):
     def __init__(self,  channels=256):

@@ -137,12 +137,28 @@ class SetAbstraction(nn.Module):
             elif sampler.lower() == 'random':
                 self.sample_fn = random_sample
             elif sampler.lower() == 'kdtree':
-                self.sample_fn = kdtree_sample
-            elif sampler.lower() == 'kdtree_adaptive':
-                # 使用自适应KDTree采样（如果可用）
+                # 叶内FPS采样
                 try:
+                    from functools import partial
+                    from ..layers.kdsample import kdtree_leaf_fps_sample
+                    sampler_args = kwargs.get('sampler_args', {}) or {}
+                    leaf_size = sampler_args.get('leaf_size', 32)
+                    self.sample_fn = partial(kdtree_leaf_fps_sample,
+                                             leaf_size=leaf_size)
+                except ImportError:
+                    logging.warning("KDTree sampler import failed, falling back to FPS")
+                    self.sample_fn = furthest_point_sample
+            elif sampler.lower() == 'kdtree_adaptive':
+                # 自适应叶内FPS采样
+                try:
+                    from functools import partial
                     from ..layers.kdsample import kdtree_adaptive_leaf_fps_sample
-                    self.sample_fn = lambda xyz, npoint: kdtree_adaptive_leaf_fps_sample(xyz, npoint, density_adaptive=True)
+                    sampler_args = kwargs.get('sampler_args', {}) or {}
+                    leaf_size = sampler_args.get('leaf_size', 32)
+                    density_adaptive = sampler_args.get('density_adaptive', True)
+                    self.sample_fn = partial(kdtree_adaptive_leaf_fps_sample,
+                                             leaf_size=leaf_size,
+                                             density_adaptive=density_adaptive)
                 except ImportError:
                     logging.warning("Adaptive KDTree sampler not available, falling back to standard KDTree")
                     self.sample_fn = kdtree_sample
