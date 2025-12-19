@@ -161,6 +161,30 @@ class SetAbstraction(nn.Module):
                 except ImportError:
                     logging.warning("Simple KDTree sampler import failed, falling back to standard KDTree")
                     self.sample_fn = kdtree_sample
+            elif sampler.lower() == 'kdtree_vectorized' or sampler.lower() == 'kdtree_simple_vectorized':
+                # GPU加速的向量化KD-Tree实现 - 推荐用于训练加速
+                try:
+                    from functools import partial
+                    from ..layers.kdsample import kdtree_simple_sample_vectorized
+                    sampler_args = kwargs.get('sampler_args', {}) or {}
+                    leaf_size = sampler_args.get('leaf_size', 32)
+                    proportional = sampler_args.get('proportional', True)
+                    self.sample_fn = partial(kdtree_simple_sample_vectorized,
+                                             leaf_size=leaf_size,
+                                             proportional=proportional)
+                    logging.info(f"Using vectorized KDTree sampler (GPU accelerated) with leaf_size={leaf_size}")
+                except ImportError as e:
+                    logging.warning(f"Vectorized KDTree sampler import failed: {e}, falling back to kdtree_simple")
+                    from functools import partial
+                    from ..layers import kdtree_simple_sample
+                    sampler_args = kwargs.get('sampler_args', {}) or {}
+                    leaf_size = sampler_args.get('leaf_size', 32)
+                    strategy = sampler_args.get('strategy', 'random')
+                    proportional = sampler_args.get('proportional', True)
+                    self.sample_fn = partial(kdtree_simple_sample,
+                                             leaf_size=leaf_size,
+                                             strategy=strategy,
+                                             proportional=proportional)
             else:
                 raise NotImplementedError(f"Sampler {sampler} not implemented")
 
