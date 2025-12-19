@@ -171,7 +171,7 @@ def crop_pc(coord, feat, label, split='train',
             crop_idx = crop_idx[shuffle_choice]
         coord, feat, label = coord[crop_idx], feat[crop_idx] if feat is not None else None, label[crop_idx] if label is not None else None
     coord -= coord.min(0) 
-    return coord.astype(np.float32), feat.astype(np.float32) if feat is not None else None , label.astype(np.long) if label is not None else None
+    return coord.astype(np.float32), feat.astype(np.float32) if feat is not None else None , label.astype(np.int64) if label is not None else None
 
 
 def get_features_by_keys(data, keys='pos,x'):

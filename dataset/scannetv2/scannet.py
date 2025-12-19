@@ -144,7 +144,7 @@ class ScanNet(Dataset):
             coord, feat, label = data[0:3]
 
         feat = (feat + 1) * 127.5
-        label = label.astype(np.long).squeeze()
+        label = label.astype(np.int64).squeeze()
         data = {'pos': coord.astype(np.float32), 'x': feat.astype(np.float32), 'y': label}
         """debug 
         from openpoints.dataset import vis_multi_points
