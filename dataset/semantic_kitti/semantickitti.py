@@ -213,7 +213,7 @@ class SemanticKITTI(Dataset):
         from openpoints.dataset.vis3d import vis_multi_points
         vis_multi_points([points, data['pos'].cpu().numpy()], labels=[labels, labels])    
         """
-        data = {'pos': points.astype(np.float32),  'y': labels.squeeze().astype(np.long)}
+        data = {'pos': points.astype(np.float32),  'y': labels.squeeze().astype(np.int64)}
         if self.transform is not None:
             data = self.transform(data)
 

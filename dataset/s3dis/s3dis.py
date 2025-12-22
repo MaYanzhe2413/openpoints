@@ -131,7 +131,7 @@ class S3DIS(Dataset):
                 coord, feat, label, self.split, self.voxel_size, self.voxel_max,
                 downsample=not self.presample, variable=self.variable, shuffle=self.shuffle)
             # TODO: do we need to -np.min in cropped data?
-        label = label.squeeze(-1).astype(np.long)
+        label = label.squeeze(-1).astype(np.int64)
         data = {'pos': coord, 'x': feat, 'y': label}
         # pre-process.
         if self.transform is not None:

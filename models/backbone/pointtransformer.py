@@ -3,6 +3,7 @@ Reference: https://github.com/POSTECH-CVLab/point-transformer
 Their result: 70.0 mIoU on S3DIS Area 5. 
 """
 from functools import partial
+from typing import Optional, Dict, Any
 import torch
 import torch.nn as nn
 import logging
@@ -77,7 +78,8 @@ class EdgeConvLayer(nn.Module):
 
 
 class TransitionDown(nn.Module):
-    def __init__(self, in_planes, out_planes, stride=1, nsample=16):
+    def __init__(self, in_planes, out_planes, stride=1, nsample=16,
+                 sampler: str = 'fps', sampler_args: Optional[Dict[str, Any]] = None):
         super().__init__()
         self.stride, self.nsample = stride, nsample
         if stride != 1:
@@ -87,18 +89,65 @@ class TransitionDown(nn.Module):
             self.linear = nn.Linear(in_planes, out_planes, bias=False)
         self.bn = nn.BatchNorm1d(out_planes)
         self.relu = nn.ReLU(inplace=True)
+        self.sampler = sampler.lower()
+        self.sampler_args = sampler_args or {}
+        if self.sampler not in ['fps', 'furthest', 'farthest', 'kdtree_simple']:
+            logging.warning(f"TransitionDown: unknown sampler {sampler}, fallback to fps")
+            self.sampler = 'fps'
+
+    def _sample_indices(self, p, o, stride):
+        # o: cumulative counts IntTensor
+        if 'kdtree_simple' in self.sampler:
+            try:
+                from openpoints.models.layers import kdtree_simple_sample
+            except ImportError:
+                logging.warning("kdtree_simple_sample import failed; fallback to furthest")
+                self.sampler = 'fps'
+            leaf_size = self.sampler_args.get('leaf_size', 32)
+            strategy = self.sampler_args.get('strategy', 'random')
+            proportional = self.sampler_args.get('proportional', True)
+            idx_list = []
+            prev = 0
+            for bi in range(o.shape[0]):
+                cur = o[bi].item()
+                count = cur - prev
+                target = count // stride
+                pts = p[prev:cur, :].unsqueeze(0)  # (1, count, 3)
+                if target <= 0:
+                    target = 1
+                local_idx = kdtree_simple_sample(pts, target,
+                                                 leaf_size=leaf_size,
+                                                 strategy=strategy,
+                                                 proportional=proportional)[0]
+                idx_list.append(local_idx + prev)
+                prev = cur
+            return torch.cat(idx_list, dim=0)
+        else:
+            n_o, count = [o[0].item() // stride], o[0].item() // stride
+            for i in range(1, o.shape[0]):
+                count += (o[i].item() - o[i - 1].item()) // stride
+                n_o.append(count)
+            n_o = torch.cuda.IntTensor(n_o)
+            return pointops.furthestsampling(p, o, n_o)
 
     def forward(self, pxo):
         p, x, o = pxo  # (n, 3), (n, c), (b)
         if self.stride != 1:
-            n_o, count = [o[0].item() // self.stride], o[0].item() // self.stride
-            for i in range(1, o.shape[0]):
-                count += (o[i].item() - o[i - 1].item()) // self.stride
-                n_o.append(count)
-            n_o = torch.cuda.IntTensor(n_o)
-            # print(n_o.device, p.device)
-            idx = pointops.furthestsampling(p, o, n_o)  # (m)
+            idx = self._sample_indices(p, o, self.stride).long()  # (m)
             n_p = p[idx.long(), :]  # (m, 3)
+            # rebuild n_o for queryandgroup when using custom sampling
+            if 'kdtree_simple' in self.sampler:
+                n_o, count = [o[0].item() // self.stride], o[0].item() // self.stride
+                for i in range(1, o.shape[0]):
+                    count += (o[i].item() - o[i - 1].item()) // self.stride
+                    n_o.append(count)
+                n_o = torch.cuda.IntTensor(n_o)
+            else:
+                n_o, count = [o[0].item() // self.stride], o[0].item() // self.stride
+                for i in range(1, o.shape[0]):
+                    count += (o[i].item() - o[i - 1].item()) // self.stride
+                    n_o.append(count)
+                n_o = torch.cuda.IntTensor(n_o)
             x = pointops.queryandgroup(self.nsample, p, n_p, x, None, o, n_o, use_xyz=True)  # (m, 3+c, nsample)
             x = self.relu(self.bn(self.linear(x).transpose(1, 2).contiguous()))  # (m, c, nsample)
             x = self.pool(x).squeeze(-1)  # (m, c)
@@ -224,7 +273,9 @@ class PTSeg(nn.Module):
                  in_channels=6,
                  num_classes=13,
                  dec_local_aggr=True,
-                 mid_res=False
+                 mid_res=False,
+                 sampler: str = 'fps',
+                 sampler_args: Optional[Dict[str, Any]] = None
                  ):
         super().__init__()
         self.c = in_channels
@@ -236,16 +287,18 @@ class PTSeg(nn.Module):
             block = eval(block)
         self.mid_res = mid_res
         self.dec_local_aggr = dec_local_aggr
+        self.sampler = sampler
+        self.sampler_args = sampler_args or {}
         self.enc1 = self._make_enc(block, planes[0], blocks[0], share_planes, stride=stride[0],
-                                   nsample=nsample[0])  # N/1
+                       nsample=nsample[0], sampler=self.sampler, sampler_args=self.sampler_args)  # N/1
         self.enc2 = self._make_enc(block, planes[1], blocks[1], share_planes, stride=stride[1],
-                                   nsample=nsample[1])  # N/4
+                       nsample=nsample[1], sampler=self.sampler, sampler_args=self.sampler_args)  # N/4
         self.enc3 = self._make_enc(block, planes[2], blocks[2], share_planes, stride=stride[2],
-                                   nsample=nsample[2])  # N/16
+                       nsample=nsample[2], sampler=self.sampler, sampler_args=self.sampler_args)  # N/16
         self.enc4 = self._make_enc(block, planes[3], blocks[3], share_planes, stride=stride[3],
-                                   nsample=nsample[3])  # N/64
+                       nsample=nsample[3], sampler=self.sampler, sampler_args=self.sampler_args)  # N/64
         self.enc5 = self._make_enc(block, planes[4], blocks[4], share_planes, stride=stride[4],
-                                   nsample=nsample[4])  # N/256
+                       nsample=nsample[4], sampler=self.sampler, sampler_args=self.sampler_args)  # N/256
 
         self.dec5 = self._make_dec(block, planes[4], 2, share_planes, nsample[4], True)  # transform p5
         self.dec4 = self._make_dec(block, planes[3], 2, share_planes, nsample[3])  # fusion p5 and p4
@@ -254,10 +307,13 @@ class PTSeg(nn.Module):
         self.dec1 = self._make_dec(block, planes[0], 2, share_planes, nsample[0])  # fusion p2 and p1
         self.cls = nn.Sequential(nn.Linear(planes[0], planes[0]), nn.BatchNorm1d(planes[0]), nn.ReLU(inplace=True),
                                  nn.Linear(planes[0], num_classes))
+        self.out_channels = planes[0]
 
-    def _make_enc(self, block, planes, blocks, share_planes=8, stride=1, nsample=16):
+    def _make_enc(self, block, planes, blocks, share_planes=8, stride=1, nsample=16,
+                  sampler: str = 'fps', sampler_args: Optional[Dict[str, Any]] = None):
         layers = []
-        layers.append(TransitionDown(self.in_planes, planes * block.expansion, stride, nsample))
+        layers.append(TransitionDown(self.in_planes, planes * block.expansion, stride, nsample,
+                                     sampler=sampler, sampler_args=sampler_args))
         self.in_planes = planes * block.expansion
         for _ in range(1, blocks):
             layers.append(block(self.in_planes, self.in_planes, share_planes, nsample=nsample, mid_res=self.mid_res))
@@ -291,3 +347,27 @@ class PTSeg(nn.Module):
         x1 = self.dec1[1:]([p1, self.dec1[0]([p1, x1, o1], [p2, x2, o2]), o1])[1]
         x = self.cls(x1)
         return x
+
+    def forward_cls_feat(self, p0, x0=None, o0=None):
+        if o0 is None:  # support dict input
+            p0, x0, o0 = p0['pos'], p0.get('x', None), p0['o']
+        if x0 is None:
+            x0 = p0
+        p1, x1, o1 = self.enc1([p0, x0, o0])
+        p2, x2, o2 = self.enc2([p1, x1, o1])
+        p3, x3, o3 = self.enc3([p2, x2, o2])
+        p4, x4, o4 = self.enc4([p3, x3, o3])
+        p5, x5, o5 = self.enc5([p4, x4, o4])
+        x5 = self.dec5[1:]([p5, self.dec5[0]([p5, x5, o5]), o5])[1]
+        x4 = self.dec4[1:]([p4, self.dec4[0]([p4, x4, o4], [p5, x5, o5]), o4])[1]
+        x3 = self.dec3[1:]([p3, self.dec3[0]([p3, x3, o3], [p4, x4, o4]), o3])[1]
+        x2 = self.dec2[1:]([p2, self.dec2[0]([p2, x2, o2], [p3, x3, o3]), o2])[1]
+        x1 = self.dec1[1:]([p1, self.dec1[0]([p1, x1, o1], [p2, x2, o2]), o1])[1]
+        # global max pool per batch according to o1
+        global_feats = []
+        for i in range(o1.shape[0]):
+            s_i = 0 if i == 0 else o1[i-1]
+            e_i = o1[i]
+            xb = x1[s_i:e_i, :]
+            global_feats.append(xb.max(dim=0, keepdim=True)[0])
+        return torch.cat(global_feats, dim=0)

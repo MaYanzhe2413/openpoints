@@ -5,6 +5,7 @@ import torch
 from torch import nn as nn
 import torch.nn.functional as F
 from .subsample import furthest_point_sample, random_sample
+from .kdsample import kdtree_simple_sample
 from .group import KNNGroup, QueryAndGroup, create_grouper, get_aggregation_feautres
 from .conv import create_convblock1d, create_convblock2d, create_linearblock, create_norm, create_act
 from .local_aggregation import CHANNEL_MAP
@@ -41,8 +42,19 @@ class SubsampleGroup(nn.Module):
             idx = furthest_point_sample(p, self.num_groups).to(torch.int64)
         elif 'random' in self.subsample.lower() or 'rs' in self.subsample.lower():
             idx = random_sample(p, self.num_groups)
+        elif 'kdtree_simple' in self.subsample.lower():
+            # Use KDTree simple leaf sampling to choose centers
+            # Default hyperparameters; can be overridden via sampler_args passed in kwargs
+            sampler_args = getattr(self, 'sampler_args', {})
+            leaf_size = sampler_args.get('leaf_size', 32)
+            strategy = sampler_args.get('strategy', 'random')
+            proportional = sampler_args.get('proportional', True)
+            idx = kdtree_simple_sample(p, self.num_groups,
+                                       leaf_size=leaf_size,
+                                       strategy=strategy,
+                                       proportional=proportional)
         else:
-            raise NotImplementedError(f'{self.subsample.lower()} is not implemented. Only support fps, random')
+            raise NotImplementedError(f'{self.subsample.lower()} is not implemented. Only support fps, random, kdtree_simple')
         center_p = torch.gather(p, 1,
                                   idx.unsqueeze(-1).expand(-1, -1, 3))  # downsampled point cloud, [B, npoint, 3]
         if x is not None:
@@ -90,6 +102,17 @@ class PointPatchEmbed(nn.Module):
             self.sample_fn = furthest_point_sample
         elif 'random' in subsample.lower():
             self.sample_fn = random_sample
+        elif 'kdtree_simple' in subsample.lower():
+            from functools import partial
+            sampler_args = kwargs.get('sampler_args', {}) or {}
+            leaf_size = sampler_args.get('leaf_size', 32)
+            strategy = sampler_args.get('strategy', 'random')
+            proportional = sampler_args.get('proportional', True)
+            self.sample_fn = partial(kdtree_simple_sample,
+                                     leaf_size=leaf_size,
+                                     strategy=strategy,
+                                     proportional=proportional)
+            self.sampler_args = sampler_args
 
         # TODO: make this embedding progressively
         self.group = group.lower()
