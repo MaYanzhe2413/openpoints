@@ -350,9 +350,10 @@ def kdtree_simple_sample(xyz: torch.Tensor, npoint: int,
 
 def kdtree_simple_sample_vectorized(xyz: torch.Tensor, npoint: int,
                                      leaf_size: int = 32,
+                                     strategy: str = 'random',
                                      proportional: bool = True) -> torch.Tensor:
     """
-    完全向量化的KD-Tree采样实现 - GPU加速版本
+    完全向量化的KD-Tree采样实现 - GPU加速版本，叶内可选多种策略。
 
     关键优化:
     1. 移除所有Python循环(for b in range(B))
@@ -364,6 +365,7 @@ def kdtree_simple_sample_vectorized(xyz: torch.Tensor, npoint: int,
         xyz: (B, N, 3) 输入点云
         npoint: 目标采样点数
         leaf_size: 叶节点最大点数
+        strategy: 'random' | 'uniform' | 'center_random' | 'quad_fps'
         proportional: 是否按叶节点大小比例分配采样配额
 
     Returns:
@@ -372,6 +374,7 @@ def kdtree_simple_sample_vectorized(xyz: torch.Tensor, npoint: int,
     B, N, C = xyz.shape
     device = xyz.device
     npoint = min(npoint, N)
+    strategy = (strategy or 'random').lower()
 
     # 计算KD-Tree深度 (log2(N/leaf_size))
     max_depth = max(1, int(np.ceil(np.log2(N / leaf_size))))
@@ -454,7 +457,8 @@ def kdtree_simple_sample_vectorized(xyz: torch.Tensor, npoint: int,
         if proportional:
             # 按比例分配
             quotas = (leaf_sizes.float() / N * npoint).round().long()
-            quotas = torch.clamp(quotas, min=1, max=leaf_sizes)
+            quotas = torch.clamp(quotas, min=1)
+            quotas = torch.minimum(quotas, leaf_sizes)
         else:
             # 平均分配
             base_quota = npoint // len(unique_leaves)
@@ -485,13 +489,98 @@ def kdtree_simple_sample_vectorized(xyz: torch.Tensor, npoint: int,
             leaf_indices = leaf_mask.nonzero(as_tuple=False).squeeze(-1)
 
             quota = quotas[i].item()
-            if quota >= len(leaf_indices):
-                # 全部选择
+            leaf_len = len(leaf_indices)
+
+            if quota >= leaf_len:
                 sampled_list.append(leaf_indices)
-            else:
-                # 随机采样
-                perm = torch.randperm(len(leaf_indices), device=device)[:quota]
-                sampled_list.append(leaf_indices[perm])
+                continue
+
+            if strategy == 'uniform':
+                pts_leaf = xyz[b, leaf_indices]
+                ranges = (pts_leaf.max(dim=0).values - pts_leaf.min(dim=0).values)
+                axis = int(torch.argmax(ranges))
+                vals = pts_leaf[:, axis]
+                _, order = torch.sort(vals)
+                step = leaf_len / quota
+                positions = (torch.arange(quota, device=device, dtype=torch.float32) * step).long()
+                positions = torch.clamp(positions, max=leaf_len - 1)
+                chosen = leaf_indices[order[positions]]
+
+            elif strategy == 'center_random':
+                pts_leaf = xyz[b, leaf_indices]
+                centroid = pts_leaf.mean(dim=0, keepdim=True)
+                d2 = ((pts_leaf - centroid) ** 2).sum(dim=1)
+                center_idx_local = torch.argmin(d2)
+                center_idx_global = leaf_indices[center_idx_local]
+                remaining = leaf_indices[torch.arange(leaf_len, device=device) != center_idx_local]
+                if quota > 1 and remaining.numel() > 0:
+                    rest = remaining[torch.randperm(remaining.numel(), device=device)[: quota - 1]]
+                    chosen = torch.cat([center_idx_global.unsqueeze(0), rest], dim=0)
+                elif quota > 1:
+                    rep = center_idx_global.repeat(quota - 1)
+                    chosen = torch.cat([center_idx_global.unsqueeze(0), rep], dim=0)
+                else:
+                    chosen = center_idx_global.unsqueeze(0)
+
+            elif strategy == 'quad_fps':
+                pts_leaf = xyz[b, leaf_indices]
+                ranges = (pts_leaf.max(dim=0).values - pts_leaf.min(dim=0).values)
+                axis = int(torch.argmax(ranges))
+                vals = pts_leaf[:, axis]
+                _, order = torch.sort(vals)
+                s = leaf_len
+                bsz = max(1, s // 4)
+                bins = [order[i * bsz:(i + 1) * bsz] for i in range(3)] + [order[3 * bsz:]]
+                parts = [leaf_indices[idxs] for idxs in bins if idxs.numel() > 0]
+                sizes = [p.numel() for p in parts]
+                total = sum(sizes)
+
+                if not parts or total == 0:
+                    perm = torch.randperm(leaf_len, device=device)[:quota]
+                    chosen = leaf_indices[perm]
+                else:
+                    alloc = [max(1, int(round(sz * quota / total))) for sz in sizes]
+                    alloc = _rebalance_quotas(alloc, sizes, quota, sizes_is_lengths=True)
+
+                    chosen_chunks = []
+                    for pidx, k_alloc in zip(parts, alloc):
+                        if k_alloc <= 0:
+                            continue
+                        if k_alloc >= pidx.numel():
+                            chosen_chunks.append(pidx)
+                            continue
+                        sub_pts = xyz[b, pidx]
+                        if sub_pts.is_cuda and CUDA_FPS_AVAILABLE:
+                            try:
+                                sub_local = _fps_cuda(sub_pts, k_alloc)
+                            except Exception:
+                                sub_local = _fps_torch(sub_pts, k_alloc)
+                        else:
+                            sub_local = _fps_torch(sub_pts, k_alloc)
+                        chosen_chunks.append(pidx[sub_local])
+
+                    chosen = torch.cat(chosen_chunks, dim=0) if chosen_chunks else leaf_indices[:0]
+                    if chosen.numel() > quota:
+                        chosen = chosen[:quota]
+                    elif chosen.numel() < quota:
+                        need = quota - chosen.numel()
+                        isin = torch.isin(leaf_indices, chosen)
+                        remaining = leaf_indices[~isin]
+                        if remaining.numel() > 0:
+                            extra = remaining[torch.randperm(remaining.numel(), device=device)[:need]]
+                            chosen = torch.cat([chosen, extra], dim=0)
+                        elif chosen.numel() > 0:
+                            rep = chosen[torch.randint(0, chosen.numel(), (need,), device=device)]
+                            chosen = torch.cat([chosen, rep], dim=0)
+                        else:
+                            perm = torch.randperm(leaf_len, device=device)[:quota]
+                            chosen = leaf_indices[perm]
+
+            else:  # random
+                perm = torch.randperm(leaf_len, device=device)[:quota]
+                chosen = leaf_indices[perm]
+
+            sampled_list.append(chosen)
 
         # 合并所有采样点
         sampled = torch.cat(sampled_list, dim=0)

@@ -243,6 +243,10 @@ class QueryAndGroup(nn.Module):
         """
         idx = ball_query(self.radius, self.nsample, support_xyz, query_xyz)
 
+        logger = getattr(self, "_neighbor_logger", None)
+        if logger is not None:
+            logger(idx)
+
         if self.return_only_idx:
             return idx
         xyz_trans = support_xyz.transpose(1, 2).contiguous()
@@ -307,6 +311,11 @@ class KNNGroup(nn.Module):
         if self.return_only_idx:
             return idx
         idx = idx.int()
+
+        logger = getattr(self, "_neighbor_logger", None)
+        if logger is not None:
+            logger(idx)
+
         xyz_trans = support_xyz.transpose(1, 2).contiguous()
         grouped_xyz = grouping_operation(xyz_trans, idx)  # (B, 3, npoint, nsample)
         if self.relative_xyz:
