@@ -13,3 +13,14 @@ from .kdsample import kdtree_simple_sample
 from .upsampling import three_interpolate, three_nn, three_interpolation
 from .attention import TransformerEncoder
 from .local_aggregation import LocalAggregation, CHANNEL_MAP
+
+from .quant_utils import (
+    MaxPool, MeanPool, SumPool,
+    get_reduction_module,
+    QAdd, QCat,
+    QuantDeQuantBoundary,
+    fuse_convbn_modules,
+    disable_quantization_for_geometry,
+    swap_custom_convs_to_standard,
+    swap_custom_convs_to_standard,
+)

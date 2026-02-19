@@ -7,21 +7,19 @@ from typing import List, Type
 import logging
 import torch
 import torch.nn as nn
+import torch.quantization as quant
 from ..build import MODELS
 from ..layers import create_convblock1d, create_convblock2d, create_act, CHANNEL_MAP, \
     create_grouper, furthest_point_sample, random_sample, three_interpolation, get_aggregation_feautres, kdtree_sample
+from ..layers.quant_utils import (
+    MaxPool, MeanPool, SumPool,
+    get_reduction_module, QAdd, QCat,
+)
 
 
 def get_reduction_fn(reduction):
-    reduction = 'mean' if reduction.lower() == 'avg' else reduction
-    assert reduction in ['sum', 'max', 'mean']
-    if reduction == 'max':
-        pool = lambda x: torch.max(x, dim=-1, keepdim=False)[0]
-    elif reduction == 'mean':
-        pool = lambda x: torch.mean(x, dim=-1, keepdim=False)
-    elif reduction == 'sum':
-        pool = lambda x: torch.sum(x, dim=-1, keepdim=False)
-    return pool
+    """Return a pooling *nn.Module*."""
+    return get_reduction_module(reduction)
 
 
 class LocalAggregation(nn.Module):
@@ -131,7 +129,8 @@ class SetAbstraction(nn.Module):
                 group_args.nsample = None
                 group_args.radius = None
             self.grouper = create_grouper(group_args)
-            self.pool = lambda x: torch.max(x, dim=-1, keepdim=False)[0]
+            self.pool = MaxPool()
+            self.qadd = QAdd()
             if sampler.lower() == 'fps':
                 self.sample_fn = furthest_point_sample
             elif sampler.lower() == 'random':
@@ -232,7 +231,7 @@ class SetAbstraction(nn.Module):
             fj = get_aggregation_feautres(new_p, dp, fi, fj, feature_type=self.feature_type)
             f = self.pool(self.convs(fj))
             if self.use_res:
-                f = self.act(f + identity)
+                f = self.act(self.qadd(f, identity))
             p = new_p
         return p, f
 
@@ -272,22 +271,23 @@ class FeaturePropogation(nn.Module):
                                                 ))
             self.convs = nn.Sequential(*convs)
 
-        self.pool = lambda x: torch.mean(x, dim=-1, keepdim=False)
+        self.pool = MeanPool()
+        self.qcat = QCat(dim=1)
 
     def forward(self, pf1, pf2=None):
         # pfb1 is with the same size of upsampled points
         if pf2 is None:
             _, f = pf1  # (B, N, 3), (B, C, N)
             f_global = self.pool(f)
-            f = torch.cat(
-                (f, self.linear2(f_global).unsqueeze(-1).expand(-1, -1, f.shape[-1])), dim=1)
+            f = self.qcat(
+                [f, self.linear2(f_global).unsqueeze(-1).expand(-1, -1, f.shape[-1])])
             f = self.linear1(f)
         else:
             p1, f1 = pf1
             p2, f2 = pf2
             if f1 is not None:
                 f = self.convs(
-                    torch.cat((f1, three_interpolation(p1, p2, f2)), dim=1))
+                    self.qcat([f1, three_interpolation(p1, p2, f2)]))
             else:
                 f = self.convs(three_interpolation(p1, p2, f2))
         return f
@@ -331,6 +331,7 @@ class InvResMLP(nn.Module):
                           )
         self.pwconv = nn.Sequential(*pwconv)
         self.act = create_act(act_args)
+        self.qadd = QAdd()
 
     def forward(self, pf):
         p, f = pf
@@ -338,7 +339,7 @@ class InvResMLP(nn.Module):
         f = self.convs([p, f])
         f = self.pwconv(f)
         if f.shape[-1] == identity.shape[-1] and self.use_res:
-            f += identity
+            f = self.qadd(f, identity)
         f = self.act(f)
         return [p, f]
 
@@ -363,13 +364,14 @@ class ResBlock(nn.Module):
                                       group_args=group_args, conv_args=conv_args,
                                       **aggr_args, **kwargs)
         self.act = create_act(act_args)
+        self.qadd = QAdd()
 
     def forward(self, pf):
         p, f = pf
         identity = f
         f = self.convs([p, f])
         if f.shape[-1] == identity.shape[-1] and self.use_res:
-            f += identity
+            f = self.qadd(f, identity)
         f = self.act(f)
         return [p, f]
 

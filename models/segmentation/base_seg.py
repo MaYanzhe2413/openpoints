@@ -5,6 +5,7 @@ import copy
 from typing import List
 import torch
 import torch.nn as nn
+from ..layers.quant_utils import ( MaxPool, MeanPool, QCat )
 import logging
 from ...utils import get_missing_parameters_message, get_unexpected_parameters_message
 from ..build import MODELS, build_model_from_cfg
@@ -113,6 +114,10 @@ class SegHead(nn.Module):
         if global_feat is not None:
             self.global_feat = global_feat.split(',')
             multiplier = len(self.global_feat) + 1
+            self.max_pool = MaxPool(dim=-1, keepdim=True)
+            self.mean_pool = MeanPool(dim=-1, keepdim=True)
+            self.qcat_global = QCat(dim=1)
+            self.qcat = QCat(dim=1)
         else:
             self.global_feat = None
             multiplier = 1
@@ -136,15 +141,16 @@ class SegHead(nn.Module):
         self.head = nn.Sequential(*heads)
 
     def forward(self, end_points):
-        if self.global_feat is not None: 
-            global_feats = [] 
+        if self.global_feat is not None:
+            global_feats = []
             for feat_type in self.global_feat:
                 if 'max' in feat_type:
-                    global_feats.append(torch.max(end_points, dim=-1, keepdim=True)[0])
+                    global_feats.append(self.max_pool(end_points))
                 elif feat_type in ['avg', 'mean']:
-                    global_feats.append(torch.mean(end_points, dim=-1, keepdim=True))
-            global_feats = torch.cat(global_feats, dim=1).expand(-1, -1, end_points.shape[-1])
-            end_points = torch.cat((end_points, global_feats), dim=1)
+                    global_feats.append(self.mean_pool(end_points))
+            global_feats = self.qcat_global(global_feats).expand(
+                -1, -1, end_points.shape[-1])
+            end_points = self.qcat([end_points, global_feats])
         logits = self.head(end_points)
         return logits
 

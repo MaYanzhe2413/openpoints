@@ -2,6 +2,7 @@ from typing import List
 
 import torch
 import torch.nn as nn
+from .quant_utils import get_reduction_module, MaxPool, QAdd
 import torch.nn.functional as F
 import numpy as np
 
@@ -95,18 +96,9 @@ class ASSA(nn.Module):
 
         # grouping and reduction 
         self.grouper = create_grouper(group_args)
-        if reduction == 'max':
-            self.reduction_layer = lambda x: torch.max(
-                x, dim=-1, keepdim=False)[0]
-        elif reduction == 'avg' or reduction == 'mean':
-            self.reduction_layer = lambda x: torch.mean(
-                x, dim=-1, keepdim=False)
-        elif reduction == 'sum':
-            self.reduction_layer = lambda x: torch.sum(
-                x, dim=-1, keepdim=False)
-        else:
-            raise NotImplementedError(
-                f'reduction {self.reduction} not implemented')
+        self.reduction_layer = get_reduction_module(reduction)
+        self.identity_pool = MaxPool()
+        self.qadd = QAdd()
 
     def forward(self, query_xyz, support_xyz, features, query_idx=None):
         """
@@ -189,18 +181,7 @@ class ConvPool(nn.Module):
         self.convs = nn.Sequential(*convs)
 
         self.grouper = create_grouper(group_args)
-        if reduction == 'max':
-            self.reduction_layer = lambda x: torch.max(
-                x, dim=-1, keepdim=False)[0]
-        elif reduction == 'avg' or reduction == 'mean':
-            self.reduction_layer = lambda x: torch.mean(
-                x, dim=-1, keepdim=False)
-        elif reduction == 'sum':
-            self.reduction_layer = lambda x: torch.sum(
-                x, dim=-1, keepdim=False)
-        else:
-            raise NotImplementedError(
-                f'reduction {self.reduction} not implemented')
+        self.reduction_layer = get_reduction_module(reduction)
 
     def forward(self, query_xyz, support_xyz, features, query_idx=None):
         """
@@ -215,7 +196,7 @@ class ConvPool(nn.Module):
         neighbor_dim = 3
         if 'df' in self.feature_type or self.use_res:
             if self.use_pooled_as_identity:
-                features = torch.max(fj, dim=-1, keepdim=False)[0]
+                features = self.identity_pool(fj)
             elif query_idx is not None:
                 # this solution gives better results!
                 if query_xyz.shape[1] != support_xyz.shape[1]:
@@ -239,7 +220,7 @@ class ConvPool(nn.Module):
         out_features = self.reduction_layer(self.convs(fj))
 
         if self.use_res:
-            out_features = self.act(out_features + identity)
+            out_features = self.act(self.qadd(out_features, identity))
         return out_features
 
 
