@@ -1,9 +1,9 @@
+import logging
 import numpy as np
-from sklearn.neighbors import KDTree
 import torch
-from typing import List, Tuple, Optional
+from typing import List
 
-# 导入 CUDA FPS
+# CUDA FPS for leaf-internal sampling
 try:
     from openpoints.cpp.pointnet2_batch import pointnet2_cuda
     CUDA_FPS_AVAILABLE = True
@@ -11,89 +11,67 @@ except ImportError:
     CUDA_FPS_AVAILABLE = False
 
 
-def kdtree_leaf_fps_sample(xyz: torch.Tensor, npoint: int, 
-                          leaf_size: int = 32, fps_ratio: float = None) -> torch.Tensor:
+def _fps_cuda(points: torch.Tensor, npoint: int) -> torch.Tensor:
     """
-    遍历KDTree的每个叶节点，在每个叶节点内部进行FPS采样
+    使用 CUDA 加速的 FPS，适用于单个点集（叶节点内）
     
     Args:
-        xyz: (B, N, 3) - 输入点云
-        npoint: int - 总采样点数
-        leaf_size: int - KDTree叶节点最大大小
-        fps_ratio: float - 每个叶节点内FPS采样的比例，None时自动计算为npoint/N
+        points: (L, 3) - GPU 上的点云
+        npoint: 采样点
     
     Returns:
-        idx: (B, npoint) - 采样索引
+        idx: (npoint,) - 采样索引
     """
-    device = xyz.device
-    B, N, C = xyz.shape
-    npoint = min(npoint, N)
+    L = points.shape[0]
+    if npoint >= L:
+        return torch.arange(L, device=points.device, dtype=torch.long)
     
-    # 自动计算采样比例
-    if fps_ratio is None:
-        fps_ratio = npoint / N
+    if not points.is_cuda or not CUDA_FPS_AVAILABLE:
+        return _fps_torch(points, npoint)
     
-    idx = torch.zeros(B, npoint, dtype=torch.long, device=device)
+    # 转换为 batch 格式 (1, L, 3)
+    pts = points.contiguous().unsqueeze(0).float()
+    temp = torch.full((1, L), 1e10, device=points.device, dtype=torch.float32)
+    output = torch.empty((1, npoint), device=points.device, dtype=torch.int32)
     
-    for b in range(B):
-        points_np = xyz[b].detach().cpu().numpy()
-        
-        # 构建KDTree
-        tree = KDTree(points_np, leaf_size=leaf_size)
-        
-        # 获取所有叶节点
-        leaf_nodes = _extract_leaf_nodes(tree, points_np, leaf_size)
-        
-        # 在每个叶节点内进行FPS采样
-        all_sampled_indices = []
-        leaf_sample_counts = []
-        
-        for leaf_indices in leaf_nodes:
-            if len(leaf_indices) == 0:
-                continue
-                
-            # 计算这个叶节点应该采样多少个点
-            leaf_npoint = max(1, int(len(leaf_indices) * fps_ratio))
-            leaf_sample_counts.append(leaf_npoint)
-            
-            # 在叶节点内进行FPS采样
-            leaf_points = points_np[leaf_indices]
-            if len(leaf_indices) <= leaf_npoint:
-                # 如果叶节点点数不够，全部选择
-                sampled_in_leaf = list(range(len(leaf_indices)))
-            else:
-                # 在叶节点内进行FPS
-                sampled_in_leaf = _fps_in_leaf(leaf_points, leaf_npoint)
-            
-            # 转换为原始索引
-            for local_idx in sampled_in_leaf:
-                all_sampled_indices.append(leaf_indices[local_idx])
-        
-        # 如果采样点数不够，从剩余点中补充
-        if len(all_sampled_indices) < npoint:
-            remaining_indices = [i for i in range(N) if i not in all_sampled_indices]
-            additional_needed = npoint - len(all_sampled_indices)
-            if remaining_indices:
-                additional_samples = np.random.choice(
-                    remaining_indices, 
-                    min(additional_needed, len(remaining_indices)), 
-                    replace=False
-                )
-                all_sampled_indices.extend(additional_samples)
-        
-        # 如果采样点数太多，随机选择
-        if len(all_sampled_indices) > npoint:
-            all_sampled_indices = np.random.choice(
-                all_sampled_indices, npoint, replace=False
-            )
-        
-        # 确保采样点数正确
-        final_indices = all_sampled_indices[:npoint]
-        idx[b] = torch.tensor(final_indices, dtype=torch.long, device=device)
+    pointnet2_cuda.furthest_point_sampling_wrapper(1, L, npoint, pts, temp, output)
+    return output[0].long()
+
+
+def _fps_torch(points: torch.Tensor, npoint: int) -> torch.Tensor:
+    """
+    纯 PyTorch 实现的 FPS（当 CUDA 不可用时的后备方案）
+    
+    Args:
+        points: (L, 3) - 点云
+        npoint: 采样点数
+    
+    Returns:
+        idx: (npoint,) - 采样索引
+    """
+    device = points.device
+    L = points.shape[0]
+    if npoint >= L:
+        return torch.arange(L, device=device, dtype=torch.long)
+    
+    idx = torch.zeros(npoint, device=device, dtype=torch.long)
+    dist = torch.full((L,), float('inf'), device=device)
+    farthest = torch.zeros(1, device=device, dtype=torch.long)
+    
+    for i in range(npoint):
+        idx[i] = farthest
+        centroid = points[farthest, :].view(1, 3)
+        d = torch.sum((points - centroid) ** 2, dim=1)
+        dist = torch.minimum(dist, d)
+        farthest = torch.argmax(dist)
     
     return idx
 
-def kdtree_leaf_simple_sample(xyz: torch.Tensor, npoint: int,
+
+
+_kdtree_simple_sample_logged = False
+
+def kdtree_simple_sample(xyz: torch.Tensor, npoint: int,
                               leaf_size: int = 32,
                               strategy: str = 'random',
                               proportional: bool = True) -> torch.Tensor:
@@ -108,6 +86,7 @@ def kdtree_leaf_simple_sample(xyz: torch.Tensor, npoint: int,
             random         : 叶内随机选择所需数量
             uniform        : 叶内按坐标排序后等间隔抽取
             center_random  : 先选叶中心附近的点，再用随机补足余下
+            fps            : leaf-internal FPS (CUDA accelerated, GPU tree + leaf FPS)
             quad_fps       : 沿最大范围轴分4段，每段内FPS，拼接结果
 f.create_prefetch_pointmap()
             True  -> leaf_quota = round(len_leaf * npoint / N)
@@ -116,9 +95,13 @@ f.create_prefetch_pointmap()
     Returns:
         idx: (B, npoint) 采样索引
     """
+    global _kdtree_simple_sample_logged
     device = xyz.device
     B, N, C = xyz.shape
     npoint = min(npoint, N)
+    if not _kdtree_simple_sample_logged:
+        logging.info(f"[Sampler] kdtree_simple_sample | B={B}, N={N}, npoint={npoint}, leaf_size={leaf_size}, strategy={strategy}, proportional={proportional} | recursive median-split + leaf {strategy} sampling")
+        _kdtree_simple_sample_logged = True
 
     # 统一路径：全部使用 torch 实现，CPU/GPU 逻辑一致
     idx_all = torch.zeros(B, npoint, dtype=torch.long, device=device)
@@ -128,10 +111,9 @@ f.create_prefetch_pointmap()
         # 递归划分得到叶节点
         init_idx = torch.arange(N, device=device, dtype=torch.long)
         leaf_nodes: List[torch.Tensor] = []
-        stack: List[torch.Tensor] = [init_idx]
-        depth = 0
+        stack = [(init_idx, 0)]  # (indices, depth)
         while stack:
-            current = stack.pop()
+            current, depth = stack.pop()
             if current.numel() <= leaf_size:
                 leaf_nodes.append(current)
                 continue
@@ -141,9 +123,8 @@ f.create_prefetch_pointmap()
             median_pos = order.numel() // 2
             left_idx = current[order[:median_pos]]
             right_idx = current[order[median_pos:]]
-            stack.append(right_idx)
-            stack.append(left_idx)
-            depth += 1
+            stack.append((right_idx, depth + 1))
+            stack.append((left_idx, depth + 1))
 
         # 计算配额
         quotas = _compute_leaf_quotas_torch(leaf_nodes, N, npoint, proportional)
@@ -249,6 +230,18 @@ f.create_prefetch_pointmap()
                 else:
                     chosen = center_idx_global.unsqueeze(0)
 
+            elif strategy == 'fps':
+                # leaf-internal FPS (CUDA accelerated)
+                pts_leaf = coords[b, leaf]  # (Ls, 3)
+                if pts_leaf.is_cuda and CUDA_FPS_AVAILABLE:
+                    try:
+                        local_idx = _fps_cuda(pts_leaf, q)
+                    except Exception:
+                        local_idx = _fps_torch(pts_leaf, q)
+                else:
+                    local_idx = _fps_torch(pts_leaf, q)
+                chosen = leaf[local_idx]
+
             else:  # random
                 perm = torch.randperm(Ls, device=device)[:q]
                 chosen = leaf[perm]
@@ -275,19 +268,6 @@ f.create_prefetch_pointmap()
         idx_all[b] = torch.as_tensor(sampled_list[:npoint], device=device, dtype=torch.long)
     return idx_all
 
-
-# ---- helper functions for kdtree_simple GPU/CPU paths ----
-def _compute_leaf_quotas(leaf_nodes: List[List[int]], N: int, npoint: int, proportional: bool) -> List[int]:
-    L = len(leaf_nodes)
-    if proportional:
-        raw = [len(leaf) * npoint / N for leaf in leaf_nodes]
-        quotas = [max(1, int(round(x))) for x in raw]
-    else:
-        base = npoint // L
-        rem = npoint % L
-        quotas = [base + (1 if i < rem else 0) for i in range(L)]
-    quotas = _rebalance_quotas(quotas, leaf_nodes, npoint)
-    return quotas
 
 def _compute_leaf_quotas_torch(leaf_nodes: List[torch.Tensor], N: int, npoint: int, proportional: bool) -> List[int]:
     L = len(leaf_nodes)
@@ -331,595 +311,3 @@ def _rebalance_quotas(quotas, leaf_nodes, target, sizes_is_lengths=False):
                 shortage -= 1
             oi += 1
     return quotas
-
-# _sample_from_leaves_cpu 已废弃，统一使用 torch 路径
-
-
-def kdtree_simple_sample(xyz: torch.Tensor, npoint: int,
-                         leaf_size: int = 32,
-                         strategy: str = 'random',
-                         proportional: bool = True) -> torch.Tensor:
-    """对外简单接口：叶节点随机/均匀采样，不使用叶内FPS。
-
-    兼容现有 sampler 调用签名 (xyz, npoint)。
-    可后续通过 partial 绑定 leaf_size / strategy。
-    """
-    return kdtree_leaf_simple_sample(xyz, npoint, leaf_size=leaf_size,
-                                     strategy=strategy, proportional=proportional)
-
-
-def kdtree_simple_sample_vectorized(xyz: torch.Tensor, npoint: int,
-                                     leaf_size: int = 32,
-                                     strategy: str = 'random',
-                                     proportional: bool = True) -> torch.Tensor:
-    """
-    完全向量化的KD-Tree采样实现 - GPU加速版本，叶内可选多种策略。
-
-    关键优化:
-    1. 移除所有Python循环(for b in range(B))
-    2. 使用批量tensor操作代替递归
-    3. 所有计算在GPU上完成,无CPU/GPU数据传输
-    4. 减少GPU kernel调用次数
-
-    Args:
-        xyz: (B, N, 3) 输入点云
-        npoint: 目标采样点数
-        leaf_size: 叶节点最大点数
-        strategy: 'random' | 'uniform' | 'center_random' | 'quad_fps'
-        proportional: 是否按叶节点大小比例分配采样配额
-
-    Returns:
-        idx: (B, npoint) 采样索引
-    """
-    B, N, C = xyz.shape
-    device = xyz.device
-    npoint = min(npoint, N)
-    strategy = (strategy or 'random').lower()
-
-    # 计算KD-Tree深度 (log2(N/leaf_size))
-    max_depth = max(1, int(np.ceil(np.log2(N / leaf_size))))
-
-    # 使用固定大小的tensor跟踪节点 - 避免动态列表
-    # node_assignment[b, n] = 该点所属的叶节点ID (-1表示未分配)
-    node_assignment = torch.zeros(B, N, dtype=torch.long, device=device)
-    node_active = torch.ones(B, N, dtype=torch.bool, device=device)
-
-    current_node_id = 0
-    leaf_node_ids = []
-
-    # 迭代构建KD-Tree - 层级处理而非递归
-    for depth in range(max_depth):
-        if not node_active.any():
-            break
-
-        split_dim = depth % 3  # 轮流选择x,y,z维度
-
-        # 找到当前深度所有活跃节点的中值
-        # 使用masked_select获取每个batch中活跃点的坐标
-        active_coords = xyz[:, :, split_dim]  # (B, N)
-
-        # 批量计算每个batch的中值
-        medians = torch.zeros(B, device=device)
-        for b in range(B):
-            if node_active[b].any():
-                active_pts = active_coords[b, node_active[b]]
-                if len(active_pts) > 0:
-                    medians[b] = active_pts.median()
-
-        # 根据中值分割 - 向量化操作
-        left_mask = (active_coords < medians.unsqueeze(1)) & node_active  # (B, N)
-        right_mask = (active_coords >= medians.unsqueeze(1)) & node_active  # (B, N)
-
-        # 检查哪些节点应该成为叶节点 (点数 <= leaf_size)
-        left_counts = left_mask.sum(dim=1)  # (B,)
-        right_counts = right_mask.sum(dim=1)  # (B,)
-
-        # 处理左子节点
-        left_is_leaf = left_counts <= leaf_size
-        for b in range(B):
-            if left_is_leaf[b] and left_counts[b] > 0:
-                # 这是叶节点,分配ID
-                node_assignment[b, left_mask[b]] = current_node_id
-                leaf_node_ids.append(current_node_id)
-                current_node_id += 1
-                # 标记这些点为不活跃(已分配到叶节点)
-                node_active[b] = node_active[b] & ~left_mask[b]
-
-        # 处理右子节点
-        right_is_leaf = right_counts <= leaf_size
-        for b in range(B):
-            if right_is_leaf[b] and right_counts[b] > 0:
-                node_assignment[b, right_mask[b]] = current_node_id + len(leaf_node_ids)
-                current_node_id += 1
-                node_active[b] = node_active[b] & ~right_mask[b]
-
-    # 处理剩余未分配的点(如果有)
-    for b in range(B):
-        if node_active[b].any():
-            node_assignment[b, node_active[b]] = current_node_id
-            current_node_id += 1
-
-    num_leaves = current_node_id
-
-    # 批量采样 - 完全向量化
-    sampled_indices = torch.zeros(B, npoint, dtype=torch.long, device=device)
-
-    # 为每个batch独立处理(但使用向量化操作)
-    for b in range(B):
-        # 获取该batch中的所有叶节点ID
-        unique_leaves = node_assignment[b].unique()
-
-        # 计算每个叶节点的配额
-        leaf_sizes = torch.zeros(len(unique_leaves), dtype=torch.long, device=device)
-        for i, leaf_id in enumerate(unique_leaves):
-            leaf_sizes[i] = (node_assignment[b] == leaf_id).sum()
-
-        if proportional:
-            # 按比例分配
-            quotas = (leaf_sizes.float() / N * npoint).round().long()
-            quotas = torch.clamp(quotas, min=1)
-            quotas = torch.minimum(quotas, leaf_sizes)
-        else:
-            # 平均分配
-            base_quota = npoint // len(unique_leaves)
-            quotas = torch.full((len(unique_leaves),), base_quota, dtype=torch.long, device=device)
-
-        # 调整配额使总和等于npoint
-        total_quota = quotas.sum()
-        if total_quota < npoint:
-            # 需要增加配额 - 优先给大的叶节点
-            diff = npoint - total_quota
-            sorted_indices = torch.argsort(leaf_sizes, descending=True)
-            for i in range(diff):
-                idx = sorted_indices[i % len(sorted_indices)]
-                if quotas[idx] < leaf_sizes[idx]:
-                    quotas[idx] += 1
-        elif total_quota > npoint:
-            # 需要减少配额
-            diff = total_quota - npoint
-            for i in range(diff):
-                adjustable = (quotas > 1).nonzero(as_tuple=False).squeeze(-1)
-                if len(adjustable) > 0:
-                    quotas[adjustable[0]] -= 1
-
-        # 从每个叶节点随机采样
-        sampled_list = []
-        for i, leaf_id in enumerate(unique_leaves):
-            leaf_mask = (node_assignment[b] == leaf_id)
-            leaf_indices = leaf_mask.nonzero(as_tuple=False).squeeze(-1)
-
-            quota = quotas[i].item()
-            leaf_len = len(leaf_indices)
-
-            if quota >= leaf_len:
-                sampled_list.append(leaf_indices)
-                continue
-
-            if strategy == 'uniform':
-                pts_leaf = xyz[b, leaf_indices]
-                ranges = (pts_leaf.max(dim=0).values - pts_leaf.min(dim=0).values)
-                axis = int(torch.argmax(ranges))
-                vals = pts_leaf[:, axis]
-                _, order = torch.sort(vals)
-                step = leaf_len / quota
-                positions = (torch.arange(quota, device=device, dtype=torch.float32) * step).long()
-                positions = torch.clamp(positions, max=leaf_len - 1)
-                chosen = leaf_indices[order[positions]]
-
-            elif strategy == 'center_random':
-                pts_leaf = xyz[b, leaf_indices]
-                centroid = pts_leaf.mean(dim=0, keepdim=True)
-                d2 = ((pts_leaf - centroid) ** 2).sum(dim=1)
-                center_idx_local = torch.argmin(d2)
-                center_idx_global = leaf_indices[center_idx_local]
-                remaining = leaf_indices[torch.arange(leaf_len, device=device) != center_idx_local]
-                if quota > 1 and remaining.numel() > 0:
-                    rest = remaining[torch.randperm(remaining.numel(), device=device)[: quota - 1]]
-                    chosen = torch.cat([center_idx_global.unsqueeze(0), rest], dim=0)
-                elif quota > 1:
-                    rep = center_idx_global.repeat(quota - 1)
-                    chosen = torch.cat([center_idx_global.unsqueeze(0), rep], dim=0)
-                else:
-                    chosen = center_idx_global.unsqueeze(0)
-
-            elif strategy == 'quad_fps':
-                pts_leaf = xyz[b, leaf_indices]
-                ranges = (pts_leaf.max(dim=0).values - pts_leaf.min(dim=0).values)
-                axis = int(torch.argmax(ranges))
-                vals = pts_leaf[:, axis]
-                _, order = torch.sort(vals)
-                s = leaf_len
-                bsz = max(1, s // 4)
-                bins = [order[i * bsz:(i + 1) * bsz] for i in range(3)] + [order[3 * bsz:]]
-                parts = [leaf_indices[idxs] for idxs in bins if idxs.numel() > 0]
-                sizes = [p.numel() for p in parts]
-                total = sum(sizes)
-
-                if not parts or total == 0:
-                    perm = torch.randperm(leaf_len, device=device)[:quota]
-                    chosen = leaf_indices[perm]
-                else:
-                    alloc = [max(1, int(round(sz * quota / total))) for sz in sizes]
-                    alloc = _rebalance_quotas(alloc, sizes, quota, sizes_is_lengths=True)
-
-                    chosen_chunks = []
-                    for pidx, k_alloc in zip(parts, alloc):
-                        if k_alloc <= 0:
-                            continue
-                        if k_alloc >= pidx.numel():
-                            chosen_chunks.append(pidx)
-                            continue
-                        sub_pts = xyz[b, pidx]
-                        if sub_pts.is_cuda and CUDA_FPS_AVAILABLE:
-                            try:
-                                sub_local = _fps_cuda(sub_pts, k_alloc)
-                            except Exception:
-                                sub_local = _fps_torch(sub_pts, k_alloc)
-                        else:
-                            sub_local = _fps_torch(sub_pts, k_alloc)
-                        chosen_chunks.append(pidx[sub_local])
-
-                    chosen = torch.cat(chosen_chunks, dim=0) if chosen_chunks else leaf_indices[:0]
-                    if chosen.numel() > quota:
-                        chosen = chosen[:quota]
-                    elif chosen.numel() < quota:
-                        need = quota - chosen.numel()
-                        isin = torch.isin(leaf_indices, chosen)
-                        remaining = leaf_indices[~isin]
-                        if remaining.numel() > 0:
-                            extra = remaining[torch.randperm(remaining.numel(), device=device)[:need]]
-                            chosen = torch.cat([chosen, extra], dim=0)
-                        elif chosen.numel() > 0:
-                            rep = chosen[torch.randint(0, chosen.numel(), (need,), device=device)]
-                            chosen = torch.cat([chosen, rep], dim=0)
-                        else:
-                            perm = torch.randperm(leaf_len, device=device)[:quota]
-                            chosen = leaf_indices[perm]
-
-            else:  # random
-                perm = torch.randperm(leaf_len, device=device)[:quota]
-                chosen = leaf_indices[perm]
-
-            sampled_list.append(chosen)
-
-        # 合并所有采样点
-        sampled = torch.cat(sampled_list, dim=0)
-
-        # 确保数量正确
-        if len(sampled) < npoint:
-            # 补充采样
-            remaining = npoint - len(sampled)
-            all_indices = torch.arange(N, device=device)
-            # 从未选中的点中随机选择
-            mask = torch.ones(N, dtype=torch.bool, device=device)
-            mask[sampled] = False
-            remaining_indices = all_indices[mask]
-            if len(remaining_indices) >= remaining:
-                extra = remaining_indices[torch.randperm(len(remaining_indices), device=device)[:remaining]]
-            else:
-                # 不够就重复采样
-                extra = sampled[torch.randint(0, len(sampled), (remaining,), device=device)]
-            sampled = torch.cat([sampled, extra], dim=0)
-        elif len(sampled) > npoint:
-            # 随机选择npoint个
-            perm = torch.randperm(len(sampled), device=device)[:npoint]
-            sampled = sampled[perm]
-
-        sampled_indices[b] = sampled[:npoint]
-
-    return sampled_indices
-
-
-def _extract_leaf_nodes(tree: KDTree, points: np.ndarray, leaf_size: int) -> List[List[int]]:
-    """
-    提取KDTree的所有叶节点及其包含的点索引
-    
-    Args:
-        tree: sklearn KDTree对象
-        points: 原始点云数组 (N, 3)
-        leaf_size: 叶节点最大大小
-    
-    Returns:
-        leaf_nodes: List[List[int]] - 每个叶节点包含的点索引列表
-    """
-    leaf_nodes = []
-    
-    # 由于sklearn KDTree内部结构不易访问，我们用另一种方法：
-    # 基于空间递归分割来模拟叶节点
-    _recursive_spatial_split(points, list(range(len(points))), leaf_size, leaf_nodes)
-    
-    return leaf_nodes
-
-
-def _recursive_spatial_split(points: np.ndarray, indices: List[int], 
-                           leaf_size: int, leaf_nodes: List[List[int]], depth: int = 0) -> None:
-    """
-    递归空间分割，模拟KDTree的叶节点分割
-    
-    Args:
-        points: 点云数组
-        indices: 当前节点包含的点索引
-        leaf_size: 叶节点最大大小
-        leaf_nodes: 输出的叶节点列表
-        depth: 当前递归深度
-    """
-    if len(indices) <= leaf_size:
-        # 达到叶节点条件
-        leaf_nodes.append(indices)
-        return
-    
-    # 选择分割维度（轮流选择x, y, z）
-    split_dim = depth % 3
-    
-    # 获取当前节点的点
-    current_points = points[indices]
-    
-    # 按选定维度排序
-    sorted_indices = sorted(indices, key=lambda i: points[i][split_dim])
-    
-    # 找到中位数分割点
-    mid = len(sorted_indices) // 2
-    
-    # 递归分割左右子树
-    left_indices = sorted_indices[:mid]
-    right_indices = sorted_indices[mid:]
-    
-    _recursive_spatial_split(points, left_indices, leaf_size, leaf_nodes, depth + 1)
-    _recursive_spatial_split(points, right_indices, leaf_size, leaf_nodes, depth + 1)
-
-
-def _fps_cuda(points: torch.Tensor, npoint: int) -> torch.Tensor:
-    """
-    使用 CUDA 加速的 FPS，适用于单个点集（叶节点内）
-    
-    Args:
-        points: (L, 3) - GPU 上的点云
-        npoint: 采样点
-    
-    Returns:
-        idx: (npoint,) - 采样索引
-    """
-    L = points.shape[0]
-    if npoint >= L:
-        return torch.arange(L, device=points.device, dtype=torch.long)
-    
-    if not points.is_cuda or not CUDA_FPS_AVAILABLE:
-        return _fps_torch(points, npoint)
-    
-    # 转换为 batch 格式 (1, L, 3)
-    pts = points.contiguous().unsqueeze(0).float()
-    temp = torch.full((1, L), 1e10, device=points.device, dtype=torch.float32)
-    output = torch.empty((1, npoint), device=points.device, dtype=torch.int32)
-    
-    pointnet2_cuda.furthest_point_sampling_wrapper(1, L, npoint, pts, temp, output)
-    return output[0].long()
-
-
-def _fps_torch(points: torch.Tensor, npoint: int) -> torch.Tensor:
-    """
-    纯 PyTorch 实现的 FPS（当 CUDA 不可用时的后备方案）
-    
-    Args:
-        points: (L, 3) - 点云
-        npoint: 采样点数
-    
-    Returns:
-        idx: (npoint,) - 采样索引
-    """
-    device = points.device
-    L = points.shape[0]
-    if npoint >= L:
-        return torch.arange(L, device=device, dtype=torch.long)
-    
-    idx = torch.zeros(npoint, device=device, dtype=torch.long)
-    dist = torch.full((L,), float('inf'), device=device)
-    farthest = torch.zeros(1, device=device, dtype=torch.long)
-    
-    for i in range(npoint):
-        idx[i] = farthest
-        centroid = points[farthest, :].view(1, 3)
-        d = torch.sum((points - centroid) ** 2, dim=1)
-        dist = torch.minimum(dist, d)
-        farthest = torch.argmax(dist)
-    
-    return idx
-
-
-def _fps_in_leaf(points: np.ndarray, npoint: int) -> List[int]:
-    """
-    在叶节点内进FPS采样（优先使用 CUDA 加速）
-    
-    Args:
-        points: 叶节点内的点 (M, 3)
-        npoint: 要采样的点数
-    
-    Returns:
-        sampled_indices: 采样点在叶节点内的索引
-    """
-    M = len(points)
-    if M <= npoint:
-        return list(range(M))
-    
-    # 尝试使用 GPU 加速
-    if CUDA_FPS_AVAILABLE and torch.cuda.is_available():
-        pts_cuda = torch.tensor(points, dtype=torch.float32, device='cuda')
-        idx = _fps_cuda(pts_cuda, npoint)
-        return idx.cpu().tolist()
-    
-    # CPU 回退：简化的FPS算法
-    sampled_indices = []
-    distances = np.full(M, np.inf)
-    
-    first_idx = 0
-    sampled_indices.append(first_idx)
-    
-    for i in range(M):
-        dist = np.linalg.norm(points[i] - points[first_idx])
-        distances[i] = min(distances[i], dist)
-    
-    for _ in range(npoint - 1):
-        farthest_idx = np.argmax(distances)
-        sampled_indices.append(farthest_idx)
-        
-        for i in range(M):
-            dist = np.linalg.norm(points[i] - points[farthest_idx])
-            distances[i] = min(distances[i], dist)
-    
-    return sampled_indices
-
-
-def kdtree_adaptive_leaf_fps_sample(xyz: torch.Tensor, npoint: int, 
-                                   leaf_size: int = 32, 
-                                   density_adaptive: bool = True) -> torch.Tensor:
-    """
-    自适应的KDTree叶节点FPS采样 - 根据叶节点密度调整采样比例
-    
-    Args:
-        xyz: (B, N, 3) - 输入点云
-        npoint: int - 总采样点数
-        leaf_size: int - KDTree叶节点最大大小
-        density_adaptive: bool - 是否根据密度自适应调整采样比例
-    
-    Returns:
-        idx: (B, npoint) - 采样索引
-    """
-    device = xyz.device
-    B, N, C = xyz.shape
-    npoint = min(npoint, N)
-    
-    idx = torch.zeros(B, npoint, dtype=torch.long, device=device)
-    
-    for b in range(B):
-        points_np = xyz[b].detach().cpu().numpy()
-        tree = KDTree(points_np, leaf_size=leaf_size)
-        
-        # 获取所有叶节点
-        leaf_nodes = _extract_leaf_nodes(tree, points_np, leaf_size)
-        
-        if density_adaptive:
-            # 根据叶节点大小计算采样权重
-            leaf_weights = [len(leaf) for leaf in leaf_nodes]
-            total_weight = sum(leaf_weights)
-            
-            # 计算每个叶节点的采样数量
-            leaf_sample_nums = []
-            allocated_samples = 0
-            
-            for i, weight in enumerate(leaf_weights):
-                if i == len(leaf_weights) - 1:
-                    # 最后一个叶节点分配剩余的采样点
-                    samples = npoint - allocated_samples
-                else:
-                    samples = int((weight / total_weight) * npoint)
-                
-                samples = min(samples, len(leaf_nodes[i]))  # 不超过叶节点大小
-                leaf_sample_nums.append(samples)
-                allocated_samples += samples
-        else:
-            # 均匀分配采样点
-            samples_per_leaf = npoint // len(leaf_nodes)
-            remainder = npoint % len(leaf_nodes)
-            
-            leaf_sample_nums = [samples_per_leaf] * len(leaf_nodes)
-            for i in range(remainder):
-                leaf_sample_nums[i] += 1
-        
-        # 在每个叶节点内进行FPS采样
-        all_sampled_indices = []
-        
-        for leaf_indices, sample_num in zip(leaf_nodes, leaf_sample_nums):
-            if sample_num == 0 or len(leaf_indices) == 0:
-                continue
-            
-            leaf_points = points_np[leaf_indices]
-            sampled_in_leaf = _fps_in_leaf(leaf_points, sample_num)
-            
-            # 转换为原始索引
-            for local_idx in sampled_in_leaf:
-                all_sampled_indices.append(leaf_indices[local_idx])
-        
-        # 确保采样点数正确
-        if len(all_sampled_indices) != npoint:
-            if len(all_sampled_indices) < npoint:
-                # 补充采样点
-                remaining = [i for i in range(N) if i not in all_sampled_indices]
-                additional = np.random.choice(remaining, npoint - len(all_sampled_indices), replace=False)
-                all_sampled_indices.extend(additional)
-            else:
-                # 随机选择
-                all_sampled_indices = np.random.choice(all_sampled_indices, npoint, replace=False)
-        
-        idx[b] = torch.tensor(all_sampled_indices[:npoint], dtype=torch.long, device=device)
-    
-    return idx
-
-
-# 简化接口，兼容PointNeXt
-def kdtree_leaf_fps_simple(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
-    """简化的KDTree叶节点FPS接口"""
-    return kdtree_leaf_fps_sample(xyz, npoint)
-
-
-if __name__ == "__main__":
-    print("🧪 测试KDTree叶节点FPS采样...")
-    
-    # 创建测试数据
-    torch.manual_seed(42)
-    np.random.seed(42)
-    
-    # 创建有明显聚类结构的点云
-    cluster1 = np.random.normal([0, 0, 0], 0.3, (300, 3))
-    cluster2 = np.random.normal([2, 0, 0], 0.3, (300, 3))
-    cluster3 = np.random.normal([0, 2, 0], 0.3, (300, 3))
-    cluster4 = np.random.normal([2, 2, 0], 0.3, (124, 3))  # 总共1024个点
-    
-    points = np.vstack([cluster1, cluster2, cluster3, cluster4])
-    xyz = torch.tensor(points, dtype=torch.float32).unsqueeze(0)  # (1, 1024, 3)
-    
-    npoint = 256
-    print(f"输入形状: {xyz.shape}")
-    print(f"采样点数: {npoint}")
-    
-    # 测试1: 基本叶节点FPS采样
-    print("\n1. 测试KDTree叶节点FPS采样...")
-    idx1 = kdtree_leaf_fps_sample(xyz, npoint, leaf_size=32, fps_ratio=0.5)
-    print(f"✅ 叶节点FPS采样结果: {idx1.shape}")
-    
-    # 测试2: 自适应叶节点FPS采样
-    print("\n2. 测试自适应叶节点FPS采样...")
-    idx2 = kdtree_adaptive_leaf_fps_sample(xyz, npoint, leaf_size=32, density_adaptive=True)
-    print(f"✅ 自适应叶节点FPS采样结果: {idx2.shape}")
-    
-    # 测试3: 非自适应叶节点FPS采样
-    print("\n3. 测试非自适应叶节点FPS采样...")
-    idx3 = kdtree_adaptive_leaf_fps_sample(xyz, npoint, leaf_size=32, density_adaptive=False)
-    print(f"✅ 非自适应叶节点FPS采样结果: {idx3.shape}")
-    
-    # 验证索引有效性
-    for i, idx in enumerate([idx1, idx2, idx3], 1):
-        assert torch.all(idx >= 0) and torch.all(idx < xyz.shape[1])
-        assert idx.shape == (xyz.shape[0], npoint)
-        print(f"✅ 测试{i}索引验证通过")
-    
-    # 分析采样结果
-    print(f"\n📊 采样结果分析:")
-    for i, (name, idx) in enumerate([
-        ("叶节点FPS", idx1), 
-        ("自适应叶节点FPS", idx2), 
-        ("非自适应叶节点FPS", idx3)
-    ], 1):
-        sampled_points = xyz[0, idx[0]].numpy()
-        
-        # 计算每个聚类的采样点数
-        cluster1_count = np.sum(np.linalg.norm(sampled_points - [0, 0, 0], axis=1) < 1.0)
-        cluster2_count = np.sum(np.linalg.norm(sampled_points - [2, 0, 0], axis=1) < 1.0)
-        cluster3_count = np.sum(np.linalg.norm(sampled_points - [0, 2, 0], axis=1) < 1.0)
-        cluster4_count = np.sum(np.linalg.norm(sampled_points - [2, 2, 0], axis=1) < 1.0)
-        
-        print(f"{name}:")
-        print(f"  聚类1采样: {cluster1_count}/300")
-        print(f"  聚类2采样: {cluster2_count}/300") 
-        print(f"  聚类3采样: {cluster3_count}/300")
-        print(f"  聚类4采样: {cluster4_count}/124")
-    
-    print("✅ 所有测试通过!")

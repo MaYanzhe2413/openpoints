@@ -7,19 +7,21 @@ from typing import List, Type
 import logging
 import torch
 import torch.nn as nn
-import torch.quantization as quant
 from ..build import MODELS
 from ..layers import create_convblock1d, create_convblock2d, create_act, CHANNEL_MAP, \
     create_grouper, furthest_point_sample, random_sample, three_interpolation, get_aggregation_feautres, kdtree_sample
-from ..layers.quant_utils import (
-    MaxPool, MeanPool, SumPool,
-    get_reduction_module, QAdd, QCat,
-)
 
 
 def get_reduction_fn(reduction):
-    """Return a pooling *nn.Module*."""
-    return get_reduction_module(reduction)
+    reduction = 'mean' if reduction.lower() == 'avg' else reduction
+    assert reduction in ['sum', 'max', 'mean']
+    if reduction == 'max':
+        pool = lambda x: torch.max(x, dim=-1, keepdim=False)[0]
+    elif reduction == 'mean':
+        pool = lambda x: torch.mean(x, dim=-1, keepdim=False)
+    elif reduction == 'sum':
+        pool = lambda x: torch.sum(x, dim=-1, keepdim=False)
+    return pool
 
 
 class LocalAggregation(nn.Module):
@@ -56,18 +58,13 @@ class LocalAggregation(nn.Module):
         self.reduction = reduction.lower()
         self.pool = get_reduction_fn(self.reduction)
         self.feature_type = feature_type
-        self.dequant_feat = quant.DeQuantStub()
-        self.quant_feat = quant.QuantStub()
 
     def forward(self, pf) -> torch.Tensor:
         # p: position, f: feature
         p, f = pf
-        # --- quant boundary: dequantize features for geometry ---
-        f_float = self.dequant_feat(f)
         # neighborhood_features
-        dp, fj = self.grouper(p, p, f_float)
-        fj = get_aggregation_feautres(p, dp, f_float, fj, self.feature_type)
-        fj = self.quant_feat(fj)
+        dp, fj = self.grouper(p, p, f)
+        fj = get_aggregation_feautres(p, dp, f, fj, self.feature_type)
         f = self.pool(self.convs(fj))
         """ DEBUG neighbor numbers. 
         if f.shape[-1] != 1:
@@ -117,7 +114,6 @@ class SetAbstraction(nn.Module):
                 in_channels, channels[-1], norm_args=None, act_args=None) if in_channels != channels[
                 -1] else nn.Identity()
             self.act = create_act(act_args)
-            self.quant_skip = quant.QuantStub()
 
         # actually, one can use local aggregation layer to replace the following
         create_conv = create_convblock1d if is_head else create_convblock2d
@@ -135,26 +131,76 @@ class SetAbstraction(nn.Module):
                 group_args.nsample = None
                 group_args.radius = None
             self.grouper = create_grouper(group_args)
-            self.pool = MaxPool()
-            self.qadd = QAdd()
-            self.dequant_feat = quant.DeQuantStub()
-            self.quant_feat = quant.QuantStub()
+            self.pool = lambda x: torch.max(x, dim=-1, keepdim=False)[0]
             if sampler.lower() == 'fps':
                 self.sample_fn = furthest_point_sample
             elif sampler.lower() == 'random':
                 self.sample_fn = random_sample
-            elif sampler.lower() in ('kdtree', 'kdtree_adaptive', 'kdtree_simple',
-                                        'kdtree_vectorized', 'kdtree_simple_vectorized'):
-                from functools import partial
-                from ..layers import kdtree_simple_sample
-                sampler_args = kwargs.get('sampler_args', {}) or {}
-                leaf_size = sampler_args.get('leaf_size', 32)
-                strategy = sampler_args.get('strategy', 'fps')
-                proportional = sampler_args.get('proportional', True)
-                self.sample_fn = partial(kdtree_simple_sample,
-                                         leaf_size=leaf_size,
-                                         strategy=strategy,
-                                         proportional=proportional)
+            elif sampler.lower() == 'kdtree':
+                # 叶内FPS采样
+                try:
+                    from functools import partial
+                    from ..layers.kdsample import kdtree_leaf_fps_sample
+                    sampler_args = kwargs.get('sampler_args', {}) or {}
+                    leaf_size = sampler_args.get('leaf_size', 32)
+                    self.sample_fn = partial(kdtree_leaf_fps_sample,
+                                             leaf_size=leaf_size)
+                except ImportError:
+                    logging.warning("KDTree sampler import failed, falling back to FPS")
+                    self.sample_fn = furthest_point_sample
+            elif sampler.lower() == 'kdtree_adaptive':
+                # 自适应叶内FPS采样
+                try:
+                    from functools import partial
+                    from ..layers.kdsample import kdtree_adaptive_leaf_fps_sample
+                    sampler_args = kwargs.get('sampler_args', {}) or {}
+                    leaf_size = sampler_args.get('leaf_size', 32)
+                    density_adaptive = sampler_args.get('density_adaptive', True)
+                    self.sample_fn = partial(kdtree_adaptive_leaf_fps_sample,
+                                             leaf_size=leaf_size,
+                                             density_adaptive=density_adaptive)
+                except ImportError:
+                    logging.warning("Adaptive KDTree sampler not available, falling back to standard KDTree")
+                    self.sample_fn = kdtree_sample
+            elif sampler.lower() == 'kdtree_simple':
+                try:
+                    from functools import partial
+                    from ..layers import kdtree_simple_sample
+                    sampler_args = kwargs.get('sampler_args', {}) or {}
+                    leaf_size = sampler_args.get('leaf_size', 32)
+                    strategy = sampler_args.get('strategy', 'random')  # random | uniform
+                    proportional = sampler_args.get('proportional', True)
+                    self.sample_fn = partial(kdtree_simple_sample,
+                                             leaf_size=leaf_size,
+                                             strategy=strategy,
+                                             proportional=proportional)
+                except ImportError:
+                    logging.warning("Simple KDTree sampler import failed, falling back to standard KDTree")
+                    self.sample_fn = kdtree_sample
+            elif sampler.lower() == 'kdtree_vectorized' or sampler.lower() == 'kdtree_simple_vectorized':
+                # GPU加速的向量化KD-Tree实现 - 推荐用于训练加速
+                try:
+                    from functools import partial
+                    from ..layers.kdsample import kdtree_simple_sample_vectorized
+                    sampler_args = kwargs.get('sampler_args', {}) or {}
+                    leaf_size = sampler_args.get('leaf_size', 32)
+                    proportional = sampler_args.get('proportional', True)
+                    self.sample_fn = partial(kdtree_simple_sample_vectorized,
+                                             leaf_size=leaf_size,
+                                             proportional=proportional)
+                    logging.info(f"Using vectorized KDTree sampler (GPU accelerated) with leaf_size={leaf_size}")
+                except ImportError as e:
+                    logging.warning(f"Vectorized KDTree sampler import failed: {e}, falling back to kdtree_simple")
+                    from functools import partial
+                    from ..layers import kdtree_simple_sample
+                    sampler_args = kwargs.get('sampler_args', {}) or {}
+                    leaf_size = sampler_args.get('leaf_size', 32)
+                    strategy = sampler_args.get('strategy', 'random')
+                    proportional = sampler_args.get('proportional', True)
+                    self.sample_fn = partial(kdtree_simple_sample,
+                                             leaf_size=leaf_size,
+                                             strategy=strategy,
+                                             proportional=proportional)
             else:
                 raise NotImplementedError(f"Sampler {sampler} not implemented")
 
@@ -175,21 +221,18 @@ class SetAbstraction(nn.Module):
             points = len(dist[dist < radius]) / (dist.shape[0] * dist.shape[1])
             logging.info(f'query size: {query_xyz.shape}, support size: {support_xyz.shape}, radius: {radius}, num_neighbors: {points}')
             DEBUG end """
-            # --- quant boundary: dequantize features for geometry ---
-            f_float = self.dequant_feat(f)
             if self.use_res or 'df' in self.feature_type:
                 fi = torch.gather(
-                    f_float, -1, idx.unsqueeze(1).expand(-1, f_float.shape[1], -1))
+                    f, -1, idx.unsqueeze(1).expand(-1, f.shape[1], -1))
                 if self.use_res:
-                    identity = self.skipconv(self.quant_skip(fi))
+                    identity = self.skipconv(fi)
             else:
                 fi = None
-            dp, fj = self.grouper(new_p, p, f_float)
+            dp, fj = self.grouper(new_p, p, f)
             fj = get_aggregation_feautres(new_p, dp, fi, fj, feature_type=self.feature_type)
-            fj = self.quant_feat(fj)
             f = self.pool(self.convs(fj))
             if self.use_res:
-                f = self.act(self.qadd(f, identity))
+                f = self.act(f + identity)
             p = new_p
         return p, f
 
@@ -229,30 +272,24 @@ class FeaturePropogation(nn.Module):
                                                 ))
             self.convs = nn.Sequential(*convs)
 
-        self.pool = MeanPool()
-        self.qcat = QCat(dim=1)
-        self.dequant_f2 = quant.DeQuantStub()
-        self.quant_interp = quant.QuantStub()
+        self.pool = lambda x: torch.mean(x, dim=-1, keepdim=False)
 
     def forward(self, pf1, pf2=None):
         # pfb1 is with the same size of upsampled points
         if pf2 is None:
             _, f = pf1  # (B, N, 3), (B, C, N)
             f_global = self.pool(f)
-            f = self.qcat(
-                [f, self.linear2(f_global).unsqueeze(-1).expand(-1, -1, f.shape[-1])])
+            f = torch.cat(
+                (f, self.linear2(f_global).unsqueeze(-1).expand(-1, -1, f.shape[-1])), dim=1)
             f = self.linear1(f)
         else:
             p1, f1 = pf1
             p2, f2 = pf2
-            # --- quant boundary: dequant before three_interpolation ---
-            f2_float = self.dequant_f2(f2)
-            interp = three_interpolation(p1, p2, f2_float)
-            interp_q = self.quant_interp(interp)
             if f1 is not None:
-                f = self.convs(self.qcat([f1, interp_q]))
+                f = self.convs(
+                    torch.cat((f1, three_interpolation(p1, p2, f2)), dim=1))
             else:
-                f = self.convs(interp_q)
+                f = self.convs(three_interpolation(p1, p2, f2))
         return f
 
 
@@ -294,7 +331,6 @@ class InvResMLP(nn.Module):
                           )
         self.pwconv = nn.Sequential(*pwconv)
         self.act = create_act(act_args)
-        self.qadd = QAdd()
 
     def forward(self, pf):
         p, f = pf
@@ -302,7 +338,7 @@ class InvResMLP(nn.Module):
         f = self.convs([p, f])
         f = self.pwconv(f)
         if f.shape[-1] == identity.shape[-1] and self.use_res:
-            f = self.qadd(f, identity)
+            f += identity
         f = self.act(f)
         return [p, f]
 
@@ -327,14 +363,13 @@ class ResBlock(nn.Module):
                                       group_args=group_args, conv_args=conv_args,
                                       **aggr_args, **kwargs)
         self.act = create_act(act_args)
-        self.qadd = QAdd()
 
     def forward(self, pf):
         p, f = pf
         identity = f
         f = self.convs([p, f])
         if f.shape[-1] == identity.shape[-1] and self.use_res:
-            f = self.qadd(f, identity)
+            f += identity
         f = self.act(f)
         return [p, f]
 
@@ -388,20 +423,7 @@ class PointNextEncoder(nn.Module):
         self.norm_args = kwargs.get('norm_args', {'norm': 'bn'}) 
         self.act_args = kwargs.get('act_args', {'act': 'relu'}) 
         self.conv_args = kwargs.get('conv_args', None)
-        # sampler can be str or list[str]; sampler_args can be dict or list[dict]
-        _sampler = kwargs.get('sampler', 'fps')
-        _sampler_args = kwargs.get('sampler_args', {})
-        n_stages = len(blocks)
-        if isinstance(_sampler, list):
-            assert len(_sampler) == n_stages, f"sampler list length {len(_sampler)} != stages {n_stages}"
-            self.sampler_list = _sampler
-        else:
-            self.sampler_list = [_sampler] * n_stages
-        if isinstance(_sampler_args, list):
-            assert len(_sampler_args) == n_stages, f"sampler_args list length {len(_sampler_args)} != stages {n_stages}"
-            self.sampler_args_list = _sampler_args
-        else:
-            self.sampler_args_list = [_sampler_args] * n_stages
+        self.sampler = kwargs.get('sampler', 'fps')
         self.expansion = kwargs.get('expansion', 4)
         self.sa_layers = sa_layers
         self.sa_use_res = sa_use_res
@@ -425,10 +447,9 @@ class PointNextEncoder(nn.Module):
             group_args.nsample = self.nsample[i]
             encoder.append(self._make_enc(
                 block, channels[i], blocks[i], stride=strides[i], group_args=group_args,
-                is_head=i == 0 and strides[i] == 1, stage_idx=i
+                is_head=i == 0 and strides[i] == 1
             ))
         self.encoder = nn.Sequential(*encoder)
-        self.quant_input = quant.QuantStub()
         self.out_channels = channels[-1]
         self.channel_list = channels
 
@@ -452,7 +473,7 @@ class PointNextEncoder(nn.Module):
                     param *= param_scaling
         return param_list
 
-    def _make_enc(self, block, channels, blocks, stride, group_args, is_head=False, stage_idx=0):
+    def _make_enc(self, block, channels, blocks, stride, group_args, is_head=False):
         layers = []
         radii = group_args.radius
         nsample = group_args.nsample
@@ -461,8 +482,7 @@ class PointNextEncoder(nn.Module):
         layers.append(SetAbstraction(self.in_channels, channels,
                                      self.sa_layers if not is_head else 1, stride,
                                      group_args=group_args,
-                                     sampler=self.sampler_list[stage_idx],
-                                     sampler_args=self.sampler_args_list[stage_idx],
+                                     sampler=self.sampler,
                                      norm_args=self.norm_args, act_args=self.act_args, conv_args=self.conv_args,
                                      is_head=is_head, use_res=self.sa_use_res, **self.aggr_args 
                                      ))
@@ -483,7 +503,6 @@ class PointNextEncoder(nn.Module):
             p0, f0 = p0['pos'], p0.get('x', None)
         if f0 is None:
             f0 = p0.clone().transpose(1, 2).contiguous()
-        f0 = self.quant_input(f0)
         for i in range(0, len(self.encoder)):
             p0, f0 = self.encoder[i]([p0, f0])
         return f0.squeeze(-1)
@@ -493,7 +512,6 @@ class PointNextEncoder(nn.Module):
             p0, f0 = p0['pos'], p0.get('x', None)
         if f0 is None:
             f0 = p0.clone().transpose(1, 2).contiguous()
-        f0 = self.quant_input(f0)
         p, f = [p0], [f0]
         for i in range(0, len(self.encoder)):
             _p, _f = self.encoder[i]([p[-1], f[-1]])

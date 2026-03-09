@@ -1,5 +1,6 @@
 # subsample layer for 3d processing.
 from abc import ABC, abstractmethod
+import logging
 
 import torch
 import torch.nn as nn
@@ -8,12 +9,7 @@ import math
 from openpoints.cpp.pointnet2_batch import pointnet2_cuda
 
 # 导入KDTree采样算法
-try:
-    from .kdsample import kdtree_leaf_fps_simple
-    KDTREE_AVAILABLE = True
-except ImportError:
-    KDTREE_AVAILABLE = False
-    print("Warning: KDTree sampling not available, sklearn not found")
+from .kdsample import kdtree_simple_sample
 
 
 class BaseSampler(ABC):
@@ -75,9 +71,16 @@ class RandomSample(BaseSampler):
         return sampled_xyz, idx
 
 
+_random_sample_logged = False
+
 def random_sample(xyz, npoint):
+    global _random_sample_logged
     B, N, _ = xyz.shape
     idx = torch.randint(0, N, (B, npoint), device=xyz.device)
+    if not _random_sample_logged:
+        logging.info(f'[Sampler] random_sample called | B={B}, N={N}, npoint={npoint} | '
+                     f'method=torch.randint (with replacement)')
+        _random_sample_logged = True
     return idx
 
 
@@ -96,6 +99,10 @@ class FurthestPointSampling(Function):
         assert xyz.is_contiguous()
 
         B, N, _ = xyz.size()
+        if not getattr(FurthestPointSampling, '_logged', False):
+            logging.info(f'[Sampler] FurthestPointSampling (FPS) called | B={B}, N={N}, npoint={npoint} | '
+                         f'method=pointnet2_cuda.furthest_point_sampling_wrapper (CUDA)')
+            FurthestPointSampling._logged = True
         # output = torch.cuda.IntTensor(B, npoint, device=xyz.device)
         # temp = torch.cuda.FloatTensor(B, N, device=xyz.device).fill_(1e10)
         output = torch.cuda.IntTensor(B, npoint)
@@ -194,20 +201,14 @@ if __name__ == '__main__':
 
 
 # KDTree采样接口
+_kdtree_sample_logged = False
+
 def kdtree_sample(xyz, npoint):
-    """
-    KDTree叶节点FPS采样接口，兼容原有的fps接口
-    
-    Args:
-        xyz: (B, N, 3) - 输入点云
-        npoint: int - 采样点数
-    
-    Returns:
-        idx: (B, npoint) - 采样索引
-    """
-    if KDTREE_AVAILABLE:
-        return kdtree_leaf_fps_simple(xyz, npoint)
-    else:
-        # 回退到原始FPS
-        print("Warning: KDTree not available, falling back to FPS")
-        return furthest_point_sample(xyz, npoint)
+    """KDTree叶节点FPS采样接口，兼容原有的fps接口"""
+    global _kdtree_sample_logged
+    B, N, _ = xyz.shape
+    if not _kdtree_sample_logged:
+        logging.info(f"[Sampler] kdtree_sample called | B={B}, N={N}, npoint={npoint} | "
+                     f"delegates to kdtree_simple_sample(strategy=fps)")
+        _kdtree_sample_logged = True
+    return kdtree_simple_sample(xyz, npoint, strategy='fps')

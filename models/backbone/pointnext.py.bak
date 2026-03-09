@@ -143,18 +143,71 @@ class SetAbstraction(nn.Module):
                 self.sample_fn = furthest_point_sample
             elif sampler.lower() == 'random':
                 self.sample_fn = random_sample
-            elif sampler.lower() in ('kdtree', 'kdtree_adaptive', 'kdtree_simple',
-                                        'kdtree_vectorized', 'kdtree_simple_vectorized'):
-                from functools import partial
-                from ..layers import kdtree_simple_sample
-                sampler_args = kwargs.get('sampler_args', {}) or {}
-                leaf_size = sampler_args.get('leaf_size', 32)
-                strategy = sampler_args.get('strategy', 'fps')
-                proportional = sampler_args.get('proportional', True)
-                self.sample_fn = partial(kdtree_simple_sample,
-                                         leaf_size=leaf_size,
-                                         strategy=strategy,
-                                         proportional=proportional)
+            elif sampler.lower() == 'kdtree':
+                # 叶内FPS采样
+                try:
+                    from functools import partial
+                    from ..layers.kdsample import kdtree_leaf_fps_sample
+                    sampler_args = kwargs.get('sampler_args', {}) or {}
+                    leaf_size = sampler_args.get('leaf_size', 32)
+                    self.sample_fn = partial(kdtree_leaf_fps_sample,
+                                             leaf_size=leaf_size)
+                except ImportError:
+                    logging.warning("KDTree sampler import failed, falling back to FPS")
+                    self.sample_fn = furthest_point_sample
+            elif sampler.lower() == 'kdtree_adaptive':
+                # 自适应叶内FPS采样
+                try:
+                    from functools import partial
+                    from ..layers.kdsample import kdtree_adaptive_leaf_fps_sample
+                    sampler_args = kwargs.get('sampler_args', {}) or {}
+                    leaf_size = sampler_args.get('leaf_size', 32)
+                    density_adaptive = sampler_args.get('density_adaptive', True)
+                    self.sample_fn = partial(kdtree_adaptive_leaf_fps_sample,
+                                             leaf_size=leaf_size,
+                                             density_adaptive=density_adaptive)
+                except ImportError:
+                    logging.warning("Adaptive KDTree sampler not available, falling back to standard KDTree")
+                    self.sample_fn = kdtree_sample
+            elif sampler.lower() == 'kdtree_simple':
+                try:
+                    from functools import partial
+                    from ..layers import kdtree_simple_sample
+                    sampler_args = kwargs.get('sampler_args', {}) or {}
+                    leaf_size = sampler_args.get('leaf_size', 32)
+                    strategy = sampler_args.get('strategy', 'random')  # random | uniform
+                    proportional = sampler_args.get('proportional', True)
+                    self.sample_fn = partial(kdtree_simple_sample,
+                                             leaf_size=leaf_size,
+                                             strategy=strategy,
+                                             proportional=proportional)
+                except ImportError:
+                    logging.warning("Simple KDTree sampler import failed, falling back to standard KDTree")
+                    self.sample_fn = kdtree_sample
+            elif sampler.lower() == 'kdtree_vectorized' or sampler.lower() == 'kdtree_simple_vectorized':
+                # GPU加速的向量化KD-Tree实现 - 推荐用于训练加速
+                try:
+                    from functools import partial
+                    from ..layers.kdsample import kdtree_simple_sample_vectorized
+                    sampler_args = kwargs.get('sampler_args', {}) or {}
+                    leaf_size = sampler_args.get('leaf_size', 32)
+                    proportional = sampler_args.get('proportional', True)
+                    self.sample_fn = partial(kdtree_simple_sample_vectorized,
+                                             leaf_size=leaf_size,
+                                             proportional=proportional)
+                    logging.info(f"Using vectorized KDTree sampler (GPU accelerated) with leaf_size={leaf_size}")
+                except ImportError as e:
+                    logging.warning(f"Vectorized KDTree sampler import failed: {e}, falling back to kdtree_simple")
+                    from functools import partial
+                    from ..layers import kdtree_simple_sample
+                    sampler_args = kwargs.get('sampler_args', {}) or {}
+                    leaf_size = sampler_args.get('leaf_size', 32)
+                    strategy = sampler_args.get('strategy', 'random')
+                    proportional = sampler_args.get('proportional', True)
+                    self.sample_fn = partial(kdtree_simple_sample,
+                                             leaf_size=leaf_size,
+                                             strategy=strategy,
+                                             proportional=proportional)
             else:
                 raise NotImplementedError(f"Sampler {sampler} not implemented")
 
@@ -388,20 +441,7 @@ class PointNextEncoder(nn.Module):
         self.norm_args = kwargs.get('norm_args', {'norm': 'bn'}) 
         self.act_args = kwargs.get('act_args', {'act': 'relu'}) 
         self.conv_args = kwargs.get('conv_args', None)
-        # sampler can be str or list[str]; sampler_args can be dict or list[dict]
-        _sampler = kwargs.get('sampler', 'fps')
-        _sampler_args = kwargs.get('sampler_args', {})
-        n_stages = len(blocks)
-        if isinstance(_sampler, list):
-            assert len(_sampler) == n_stages, f"sampler list length {len(_sampler)} != stages {n_stages}"
-            self.sampler_list = _sampler
-        else:
-            self.sampler_list = [_sampler] * n_stages
-        if isinstance(_sampler_args, list):
-            assert len(_sampler_args) == n_stages, f"sampler_args list length {len(_sampler_args)} != stages {n_stages}"
-            self.sampler_args_list = _sampler_args
-        else:
-            self.sampler_args_list = [_sampler_args] * n_stages
+        self.sampler = kwargs.get('sampler', 'fps')
         self.expansion = kwargs.get('expansion', 4)
         self.sa_layers = sa_layers
         self.sa_use_res = sa_use_res
@@ -425,7 +465,7 @@ class PointNextEncoder(nn.Module):
             group_args.nsample = self.nsample[i]
             encoder.append(self._make_enc(
                 block, channels[i], blocks[i], stride=strides[i], group_args=group_args,
-                is_head=i == 0 and strides[i] == 1, stage_idx=i
+                is_head=i == 0 and strides[i] == 1
             ))
         self.encoder = nn.Sequential(*encoder)
         self.quant_input = quant.QuantStub()
@@ -452,7 +492,7 @@ class PointNextEncoder(nn.Module):
                     param *= param_scaling
         return param_list
 
-    def _make_enc(self, block, channels, blocks, stride, group_args, is_head=False, stage_idx=0):
+    def _make_enc(self, block, channels, blocks, stride, group_args, is_head=False):
         layers = []
         radii = group_args.radius
         nsample = group_args.nsample
@@ -461,8 +501,7 @@ class PointNextEncoder(nn.Module):
         layers.append(SetAbstraction(self.in_channels, channels,
                                      self.sa_layers if not is_head else 1, stride,
                                      group_args=group_args,
-                                     sampler=self.sampler_list[stage_idx],
-                                     sampler_args=self.sampler_args_list[stage_idx],
+                                     sampler=self.sampler,
                                      norm_args=self.norm_args, act_args=self.act_args, conv_args=self.conv_args,
                                      is_head=is_head, use_res=self.sa_use_res, **self.aggr_args 
                                      ))
