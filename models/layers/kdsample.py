@@ -74,7 +74,8 @@ _kdtree_simple_sample_logged = False
 def kdtree_simple_sample(xyz: torch.Tensor, npoint: int,
                               leaf_size: int = 32,
                               strategy: str = 'random',
-                              proportional: bool = True) -> torch.Tensor:
+                              proportional: bool = True,
+                              axis_strategy: str = 'cycle') -> torch.Tensor:
     """
     更简KDTree叶节点采样：不执行叶内FPS，只做随机或均匀采样。
 
@@ -88,6 +89,9 @@ def kdtree_simple_sample(xyz: torch.Tensor, npoint: int,
             center_random  : 先选叶中心附近的点，再用随机补足余下
             fps            : leaf-internal FPS (CUDA accelerated, GPU tree + leaf FPS)
             quad_fps       : 沿最大范围轴分4段，每段内FPS，拼接结果
+        axis_strategy: 'cycle' | 'max_spread'
+            cycle      : 沿 xyz 轴轮换 (depth % 3)，标准简化做法
+            max_spread : 选当前节点范围最大的轴切分，更均衡
 f.create_prefetch_pointmap()
             True  -> leaf_quota = round(len_leaf * npoint / N)
             False -> 所有叶平均分配 (基础 = npoint // L, 余数前 r 个 +1)
@@ -100,7 +104,7 @@ f.create_prefetch_pointmap()
     B, N, C = xyz.shape
     npoint = min(npoint, N)
     if not _kdtree_simple_sample_logged:
-        logging.info(f"[Sampler] kdtree_simple_sample | B={B}, N={N}, npoint={npoint}, leaf_size={leaf_size}, strategy={strategy}, proportional={proportional} | recursive median-split + leaf {strategy} sampling")
+        logging.info(f"[Sampler] kdtree_simple_sample | B={B}, N={N}, npoint={npoint}, leaf_size={leaf_size}, strategy={strategy}, proportional={proportional}, axis_strategy={axis_strategy} | recursive median-split ({axis_strategy}) + leaf {strategy} sampling")
         _kdtree_simple_sample_logged = True
 
     # 统一路径：全部使用 torch 实现，CPU/GPU 逻辑一致
@@ -117,7 +121,12 @@ f.create_prefetch_pointmap()
             if current.numel() <= leaf_size:
                 leaf_nodes.append(current)
                 continue
-            dim = depth % 3
+            if axis_strategy == 'max_spread':
+                pts_b = coords[b, current]  # (M, 3)
+                spread = pts_b.max(dim=0).values - pts_b.min(dim=0).values  # (3,)
+                dim = int(spread.argmax().item())
+            else:  # 'cycle' (default)
+                dim = depth % 3
             pts = coords[b, current, dim]
             _, order = torch.sort(pts)
             median_pos = order.numel() // 2
