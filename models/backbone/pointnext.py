@@ -151,10 +151,12 @@ class SetAbstraction(nn.Module):
                 leaf_size = sampler_args.get('leaf_size', 32)
                 strategy = sampler_args.get('strategy', 'fps')
                 proportional = sampler_args.get('proportional', True)
+                axis_strategy = sampler_args.get('axis_strategy', 'cycle')
                 self.sample_fn = partial(kdtree_simple_sample,
                                          leaf_size=leaf_size,
                                          strategy=strategy,
-                                         proportional=proportional)
+                                         proportional=proportional,
+                                         axis_strategy=axis_strategy)
             else:
                 raise NotImplementedError(f"Sampler {sampler} not implemented")
 
