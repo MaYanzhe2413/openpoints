@@ -432,6 +432,11 @@ class PointNextEncoder(nn.Module):
         self.encoder = nn.Sequential(*encoder)
         self.quant_input = quant.QuantStub()
         self.out_channels = channels[-1]
+        # coord fake-quant: simulate n-bit coordinates (0 = disabled, FP32)
+        self.coord_nbits = kwargs.get('coord_nbits', 0)
+        if self.coord_nbits and self.coord_nbits > 0:
+            logging.info(f'[CoordQuant] coordinates fake-quantized to {self.coord_nbits}-bit '
+                         f'(per-sample, per-axis min/max)')
         self.channel_list = channels
 
     def _to_full_list(self, param, param_scaling=1):
@@ -480,9 +485,22 @@ class PointNextEncoder(nn.Module):
                                 ))
         return nn.Sequential(*layers)
 
+    def _fake_quant_coords(self, p):
+        """Simulate n-bit coordinates: per-sample, per-axis min/max uniform quantization.
+        p: (B, N, 3). Returns dequantized coords with quantization error injected."""
+        if not self.coord_nbits or self.coord_nbits <= 0:
+            return p
+        levels = float(2 ** self.coord_nbits - 1)
+        p_min = p.amin(dim=1, keepdim=True)              # (B,1,3)
+        p_max = p.amax(dim=1, keepdim=True)              # (B,1,3)
+        scale = (p_max - p_min).clamp(min=1e-6) / levels  # (B,1,3)
+        q = torch.round((p - p_min) / scale)
+        return q * scale + p_min
+
     def forward_cls_feat(self, p0, f0=None):
         if hasattr(p0, 'keys'):
             p0, f0 = p0['pos'], p0.get('x', None)
+        p0 = self._fake_quant_coords(p0)
         if f0 is None:
             f0 = p0.clone().transpose(1, 2).contiguous()
         f0 = self.quant_input(f0)
@@ -493,6 +511,7 @@ class PointNextEncoder(nn.Module):
     def forward_seg_feat(self, p0, f0=None):
         if hasattr(p0, 'keys'):
             p0, f0 = p0['pos'], p0.get('x', None)
+        p0 = self._fake_quant_coords(p0)
         if f0 is None:
             f0 = p0.clone().transpose(1, 2).contiguous()
         f0 = self.quant_input(f0)
