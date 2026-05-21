@@ -203,7 +203,10 @@ class FeaturePropogation(nn.Module):
     def __init__(self, mlp,
                  upsample=True,
                  norm_args={'norm': 'bn1d'},
-                 act_args={'act': 'relu'}
+                 act_args={'act': 'relu'},
+                 coord_knn_nbits=0,
+                 coord_weight_nbits=0,
+                 coord_topk=0,
                  ):
         """
         Args:
@@ -211,8 +214,13 @@ class FeaturePropogation(nn.Module):
             out_channels:
             norm_args:
             act_args:
+            coord_knn_nbits/coord_weight_nbits/coord_topk: decoder interpolation
+                coordinate-quantization ablation knobs (0 = FP32, original behaviour)
         """
         super().__init__()
+        self.coord_knn_nbits = coord_knn_nbits
+        self.coord_weight_nbits = coord_weight_nbits
+        self.coord_topk = coord_topk
         if not upsample:
             self.linear2 = nn.Sequential(
                 nn.Linear(mlp[0], mlp[1]), nn.ReLU(inplace=True))
@@ -249,7 +257,10 @@ class FeaturePropogation(nn.Module):
             p2, f2 = pf2
             # --- quant boundary: dequant before three_interpolation ---
             f2_float = self.dequant_f2(f2)
-            interp = three_interpolation(p1, p2, f2_float)
+            interp = three_interpolation(p1, p2, f2_float,
+                                         knn_nbits=self.coord_knn_nbits,
+                                         weight_nbits=self.coord_weight_nbits,
+                                         topk=self.coord_topk)
             interp_q = self.quant_interp(interp)
             if f1 is not None:
                 f = self.convs(self.qcat([f1, interp_q]))
@@ -542,6 +553,15 @@ class PointNextDecoder(nn.Module):
             skip_channels.insert(0, kwargs.get('in_channels', 3))
         # the output channel after interpolation
         fp_channels = encoder_channel_list[:decoder_stages]
+        # decoder interpolation coord-quant ablation knobs (0 = FP32)
+        self.coord_knn_nbits = kwargs.get('coord_knn_nbits', 0)
+        self.coord_weight_nbits = kwargs.get('coord_weight_nbits', 0)
+        self.coord_topk = kwargs.get('coord_topk', 0)
+        if self.coord_knn_nbits or self.coord_weight_nbits or self.coord_topk:
+            logging.info(f'[DecoderCoordQuant] three_interpolation: '
+                         f'knn_nbits={self.coord_knn_nbits}, '
+                         f'weight_nbits={self.coord_weight_nbits}, '
+                         f'topk={self.coord_topk}')
 
         n_decoder_stages = len(fp_channels)
         decoder = [[] for _ in range(n_decoder_stages)]
@@ -555,7 +575,10 @@ class PointNextDecoder(nn.Module):
         layers = []
         mlp = [skip_channels + self.in_channels] + \
               [fp_channels] * self.decoder_layers
-        layers.append(FeaturePropogation(mlp))
+        layers.append(FeaturePropogation(mlp,
+                                         coord_knn_nbits=self.coord_knn_nbits,
+                                         coord_weight_nbits=self.coord_weight_nbits,
+                                         coord_topk=self.coord_topk))
         self.in_channels = fp_channels
         return nn.Sequential(*layers)
 

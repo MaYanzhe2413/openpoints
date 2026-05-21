@@ -89,17 +89,78 @@ class ThreeInterpolate(Function):
 three_interpolate = ThreeInterpolate.apply
 
 
-def three_interpolation(unknown_xyz, known_xyz, know_feat):
+def _fake_quant_xyz(p, nbits):
+    """Fake-quantize coordinates (per-sample, per-axis uniform).
+    nbits<=0 : no-op (FP32)
+    nbits=-1 : FP16
+    nbits>=1 : n-bit fixed-point uniform quant (e.g. 8/12/16 = int8/int12/int16)"""
+    if not nbits or nbits == 0:
+        return p
+    if nbits == -1:
+        return p.half().float()
+    if nbits < 0:
+        return p
+    levels = float(2 ** nbits - 1)
+    p_min = p.amin(dim=1, keepdim=True)
+    p_max = p.amax(dim=1, keepdim=True)
+    scale = (p_max - p_min).clamp(min=1e-6) / levels
+    return torch.round((p - p_min) / scale) * scale + p_min
+
+
+def three_interpolation(unknown_xyz, known_xyz, know_feat,
+                        knn_nbits=0, weight_nbits=0, topk=0):
     """
     input: known_xyz: (m, 3), unknown_xyz: (n, 3), feat: (m, c), offset: (b), new_offset: (b)
     output: (n, c)
+
+    Coordinate-quantization ablation knobs (all default 0 = original FP32 behaviour):
+        knn_nbits   : coord precision for selecting the 3-NN indices
+        weight_nbits: coord precision for computing the interpolation weights
+        topk        : if >3, select topk candidates with knn_nbits coords,
+                      then refine to top3 with weight_nbits coords
     """
-    dist, idx = three_nn(unknown_xyz, known_xyz)
+    # original fast path
+    if knn_nbits <= 0 and weight_nbits <= 0 and topk <= 0:
+        dist, idx = three_nn(unknown_xyz, known_xyz)
+        dist_recip = 1.0 / (dist + 1e-8)
+        norm = torch.sum(dist_recip, dim=2, keepdim=True)
+        weight = dist_recip / norm
+        return three_interpolate(know_feat, idx, weight)
+
+    # ablation path
+    B, N, _ = unknown_xyz.shape
+    xyz_knn = _fake_quant_xyz(unknown_xyz, knn_nbits)
+    kxyz_knn = _fake_quant_xyz(known_xyz, knn_nbits)
+    xyz_w = _fake_quant_xyz(unknown_xyz, weight_nbits)
+    kxyz_w = _fake_quant_xyz(known_xyz, weight_nbits)
+
+    if topk and topk > 3:
+        # int8 (knn-precision) topk candidates
+        K = min(int(topk), kxyz_knn.shape[1])
+        cdist = torch.cdist(xyz_knn, kxyz_knn)                       # (B,N,M)
+        _, cand_idx = cdist.topk(K, dim=2, largest=False)            # (B,N,K)
+        # refine: recompute candidate distances with weight-precision coords
+        cand_kxyz = torch.gather(
+            kxyz_w.unsqueeze(1).expand(B, N, -1, -1), 2,
+            cand_idx.unsqueeze(-1).expand(-1, -1, -1, 3))            # (B,N,K,3)
+        refine_d = torch.norm(cand_kxyz - xyz_w.unsqueeze(2), dim=-1)  # (B,N,K)
+        top3_d, top3_local = refine_d.topk(3, dim=2, largest=False)  # (B,N,3)
+        idx = torch.gather(cand_idx, 2, top3_local).int().contiguous()
+        dist = top3_d
+    else:
+        # 3-NN idx from knn-precision coords
+        _, idx = three_nn(xyz_knn.contiguous(), kxyz_knn.contiguous())  # (B,N,3) int
+        # recompute neighbour distances with weight-precision coords
+        nb_kxyz = torch.gather(
+            kxyz_w.unsqueeze(1).expand(B, N, -1, -1), 2,
+            idx.long().unsqueeze(-1).expand(-1, -1, -1, 3))          # (B,N,3,3)
+        dist = torch.norm(nb_kxyz - xyz_w.unsqueeze(2), dim=-1)      # (B,N,3)
+        idx = idx.int().contiguous()
+
     dist_recip = 1.0 / (dist + 1e-8)
     norm = torch.sum(dist_recip, dim=2, keepdim=True)
-    weight = dist_recip / norm
-    interpolated_feats = three_interpolate(know_feat, idx, weight)
-    return interpolated_feats
+    weight = (dist_recip / norm).contiguous()
+    return three_interpolate(know_feat, idx, weight)
 
 
 if __name__ == "__main__":
