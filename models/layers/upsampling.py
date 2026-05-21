@@ -135,18 +135,27 @@ def three_interpolation(unknown_xyz, known_xyz, know_feat,
     kxyz_w = _fake_quant_xyz(known_xyz, weight_nbits)
 
     if topk and topk > 3:
-        # int8 (knn-precision) topk candidates
+        # int8 (knn-precision) topk candidates + weight-precision refine.
+        # chunk over fine points to avoid materializing the full (N,M) cdist.
         K = min(int(topk), kxyz_knn.shape[1])
-        cdist = torch.cdist(xyz_knn, kxyz_knn)                       # (B,N,M)
-        _, cand_idx = cdist.topk(K, dim=2, largest=False)            # (B,N,K)
-        # refine: recompute candidate distances with weight-precision coords
-        cand_kxyz = torch.gather(
-            kxyz_w.unsqueeze(1).expand(B, N, -1, -1), 2,
-            cand_idx.unsqueeze(-1).expand(-1, -1, -1, 3))            # (B,N,K,3)
-        refine_d = torch.norm(cand_kxyz - xyz_w.unsqueeze(2), dim=-1)  # (B,N,K)
-        top3_d, top3_local = refine_d.topk(3, dim=2, largest=False)  # (B,N,3)
-        idx = torch.gather(cand_idx, 2, top3_local).int().contiguous()
-        dist = top3_d
+        chunk = 4096
+        idx_parts, dist_parts = [], []
+        for s in range(0, N, chunk):
+            e = min(s + chunk, N)
+            c = e - s
+            cd = torch.cdist(xyz_knn[:, s:e], kxyz_knn)              # (B,c,M)
+            _, cand_idx = cd.topk(K, dim=2, largest=False)           # (B,c,K)
+            # refine: recompute candidate distances with weight-precision coords
+            cand_kxyz = torch.gather(
+                kxyz_w.unsqueeze(1).expand(B, c, -1, -1), 2,
+                cand_idx.unsqueeze(-1).expand(-1, -1, -1, 3))        # (B,c,K,3)
+            refine_d = torch.norm(
+                cand_kxyz - xyz_w[:, s:e].unsqueeze(2), dim=-1)      # (B,c,K)
+            top3_d, top3_local = refine_d.topk(3, dim=2, largest=False)
+            idx_parts.append(torch.gather(cand_idx, 2, top3_local))
+            dist_parts.append(top3_d)
+        idx = torch.cat(idx_parts, dim=1).int().contiguous()        # (B,N,3)
+        dist = torch.cat(dist_parts, dim=1)                         # (B,N,3)
     else:
         # 3-NN idx from knn-precision coords
         _, idx = three_nn(xyz_knn.contiguous(), kxyz_knn.contiguous())  # (B,N,3) int
