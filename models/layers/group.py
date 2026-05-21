@@ -203,6 +203,23 @@ class BallQuery(Function):
 ball_query = BallQuery.apply
 
 
+def _fake_quant_xyz(p, nbits):
+    """Fake-quantize coordinates (per-sample, per-axis uniform).
+    nbits<=0 : no-op (FP32);  nbits=-1 : FP16;
+    nbits>=1 : n-bit fixed-point uniform quant (8/12/16 = int8/int12/int16)."""
+    if not nbits or nbits == 0:
+        return p
+    if nbits == -1:
+        return p.half().float()
+    if nbits < 0:
+        return p
+    levels = float(2 ** nbits - 1)
+    p_min = p.amin(dim=1, keepdim=True)
+    p_max = p.amax(dim=1, keepdim=True)
+    scale = (p_max - p_min).clamp(min=1e-6) / levels
+    return torch.round((p - p_min) / scale) * scale + p_min
+
+
 class QueryAndGroup(nn.Module):
     def __init__(self, radius: float, nsample: int,
                  relative_xyz=True,
@@ -231,6 +248,9 @@ class QueryAndGroup(nn.Module):
         assert self.normalize_dp + self.normalize_by_std + self.normalize_by_allstd < 2   # only nomalize by one method
         self.relative_xyz = relative_xyz
         self.return_only_idx = return_only_idx
+        # encoder coord-quant ablation knobs (0 = FP32, original behaviour)
+        self.coord_bq_nbits = kwargs.get('coord_bq_nbits', 0)   # ball_query neighbour selection
+        self.coord_dp_nbits = kwargs.get('coord_dp_nbits', 0)   # dp relative position
 
     def forward(self, query_xyz: torch.Tensor, support_xyz: torch.Tensor, features: torch.Tensor = None) -> Tuple[
         torch.Tensor]:
@@ -241,7 +261,10 @@ class QueryAndGroup(nn.Module):
         :return:
             new_features: (B, 3 + C, npoint, nsample)
         """
-        idx = ball_query(self.radius, self.nsample, support_xyz, query_xyz)
+        # ball_query neighbour selection with bq-precision coords
+        s_bq = _fake_quant_xyz(support_xyz, self.coord_bq_nbits).contiguous()
+        q_bq = _fake_quant_xyz(query_xyz, self.coord_bq_nbits).contiguous()
+        idx = ball_query(self.radius, self.nsample, s_bq, q_bq)
 
         logger = getattr(self, "_neighbor_logger", None)
         if logger is not None:
@@ -249,10 +272,13 @@ class QueryAndGroup(nn.Module):
 
         if self.return_only_idx:
             return idx
-        xyz_trans = support_xyz.transpose(1, 2).contiguous()
+        # dp relative position with dp-precision coords
+        s_dp = _fake_quant_xyz(support_xyz, self.coord_dp_nbits)
+        q_dp = _fake_quant_xyz(query_xyz, self.coord_dp_nbits)
+        xyz_trans = s_dp.transpose(1, 2).contiguous()
         grouped_xyz = grouping_operation(xyz_trans, idx)  # (B, 3, npoint, nsample)
         if self.relative_xyz:
-            grouped_xyz = grouped_xyz - query_xyz.transpose(1, 2).unsqueeze(-1)  # relative position
+            grouped_xyz = grouped_xyz - q_dp.transpose(1, 2).unsqueeze(-1)  # relative position
             if self.normalize_dp:
                 grouped_xyz /= self.radius
         grouped_features = grouping_operation(features, idx) if features is not None else None

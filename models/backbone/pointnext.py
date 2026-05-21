@@ -11,6 +11,7 @@ import torch.quantization as quant
 from ..build import MODELS
 from ..layers import create_convblock1d, create_convblock2d, create_act, CHANNEL_MAP, \
     create_grouper, furthest_point_sample, random_sample, three_interpolation, get_aggregation_feautres, kdtree_sample
+from ..layers.group import _fake_quant_xyz
 from ..layers.quant_utils import (
     MaxPool, MeanPool, SumPool,
     get_reduction_module, QAdd, QCat,
@@ -130,11 +131,17 @@ class SetAbstraction(nn.Module):
                                      **conv_args)
                          )
         self.convs = nn.Sequential(*convs)
+        # encoder coord-quant ablation knobs (0 = FP32, original behaviour)
+        self.coord_sample_nbits = kwargs.get('coord_sample_nbits', 0)
+        _coord_bq_nbits = kwargs.get('coord_bq_nbits', 0)
+        _coord_dp_nbits = kwargs.get('coord_dp_nbits', 0)
         if not is_head:
             if self.all_aggr:
                 group_args.nsample = None
                 group_args.radius = None
             self.grouper = create_grouper(group_args)
+            self.grouper.coord_bq_nbits = _coord_bq_nbits
+            self.grouper.coord_dp_nbits = _coord_dp_nbits
             self.pool = MaxPool()
             self.qadd = QAdd()
             self.dequant_feat = quant.DeQuantStub()
@@ -166,7 +173,10 @@ class SetAbstraction(nn.Module):
             f = self.convs(f)  # (n, c)
         else:
             if not self.all_aggr:
-                idx = self.sample_fn(p, p.shape[1] // self.stride).long()
+                # sampling uses sample-precision coords for index selection;
+                # the gathered query points keep their original (FP32) values
+                p_sample = _fake_quant_xyz(p, self.coord_sample_nbits)
+                idx = self.sample_fn(p_sample, p.shape[1] // self.stride).long()
                 new_p = torch.gather(p, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
             else:
                 new_p = p
@@ -419,6 +429,10 @@ class PointNextEncoder(nn.Module):
         self.sa_layers = sa_layers
         self.sa_use_res = sa_use_res
         self.use_res = kwargs.get('use_res', True)
+        # encoder fine-grained coord-quant ablation knobs (0 = FP32)
+        self.coord_sample_nbits = kwargs.get('coord_sample_nbits', 0)
+        self.coord_bq_nbits = kwargs.get('coord_bq_nbits', 0)
+        self.coord_dp_nbits = kwargs.get('coord_dp_nbits', 0)
         radius_scaling = kwargs.get('radius_scaling', 2)
         nsample_scaling = kwargs.get('nsample_scaling', 1)
 
@@ -448,6 +462,10 @@ class PointNextEncoder(nn.Module):
         if self.coord_nbits and self.coord_nbits > 0:
             logging.info(f'[CoordQuant] coordinates fake-quantized to {self.coord_nbits}-bit '
                          f'(per-sample, per-axis min/max)')
+        # encoder fine-grained coord-quant ablation knobs (0 = FP32)
+        if (self.coord_sample_nbits or self.coord_bq_nbits or self.coord_dp_nbits):
+            logging.info(f'[EncoderCoordQuant] sample_nbits={self.coord_sample_nbits}, '
+                         f'bq_nbits={self.coord_bq_nbits}, dp_nbits={self.coord_dp_nbits}')
         self.channel_list = channels
 
     def _to_full_list(self, param, param_scaling=1):
@@ -482,7 +500,11 @@ class PointNextEncoder(nn.Module):
                                      sampler=self.sampler_list[stage_idx],
                                      sampler_args=self.sampler_args_list[stage_idx],
                                      norm_args=self.norm_args, act_args=self.act_args, conv_args=self.conv_args,
-                                     is_head=is_head, use_res=self.sa_use_res, **self.aggr_args 
+                                     is_head=is_head, use_res=self.sa_use_res,
+                                     coord_sample_nbits=self.coord_sample_nbits,
+                                     coord_bq_nbits=self.coord_bq_nbits,
+                                     coord_dp_nbits=self.coord_dp_nbits,
+                                     **self.aggr_args
                                      ))
         self.in_channels = channels
         for i in range(1, blocks):
