@@ -220,6 +220,24 @@ def _fake_quant_xyz(p, nbits):
     return torch.round((p - p_min) / scale) * scale + p_min
 
 
+def _fake_quant_dp_norm(dp, nbits):
+    """Fake-quantize normalized dp values (already in [-1, +1] after /radius).
+    Hardware-style symmetric quant: scale = 1 / 2^(N-1) (e.g. 1/128 for N=8),
+    levels = 2^N (e.g. 256 for N=8). Clamps to [-1, +1] before quantizing.
+    nbits<=0 : no-op (FP32);  nbits=-1 : FP16;
+    nbits>=1 : N-bit uniform on [-1, +1]."""
+    if not nbits or nbits == 0:
+        return dp
+    if nbits == -1:
+        return dp.half().float()
+    if nbits < 0:
+        return dp
+    half = float(2 ** (nbits - 1))
+    scale = 1.0 / half                                # e.g. 1/128 for nbits=8
+    dp_clamped = dp.clamp(-1.0, 1.0)
+    return torch.round(dp_clamped / scale) * scale
+
+
 class QueryAndGroup(nn.Module):
     def __init__(self, radius: float, nsample: int,
                  relative_xyz=True,
@@ -250,7 +268,8 @@ class QueryAndGroup(nn.Module):
         self.return_only_idx = return_only_idx
         # encoder coord-quant ablation knobs (0 = FP32, original behaviour)
         self.coord_bq_nbits = kwargs.get('coord_bq_nbits', 0)   # ball_query neighbour selection
-        self.coord_dp_nbits = kwargs.get('coord_dp_nbits', 0)   # dp relative position
+        self.coord_dp_nbits = kwargs.get('coord_dp_nbits', 0)   # dp relative position (source coords)
+        self.coord_dp_postquant_nbits = kwargs.get('coord_dp_postquant_nbits', 0)  # dp after /radius
 
     def forward(self, query_xyz: torch.Tensor, support_xyz: torch.Tensor, features: torch.Tensor = None) -> Tuple[
         torch.Tensor]:
@@ -281,6 +300,8 @@ class QueryAndGroup(nn.Module):
             grouped_xyz = grouped_xyz - q_dp.transpose(1, 2).unsqueeze(-1)  # relative position
             if self.normalize_dp:
                 grouped_xyz /= self.radius
+            # post-normalize dp quantization (simulates hardware uint8 quant of dp_norm in [-1, +1])
+            grouped_xyz = _fake_quant_dp_norm(grouped_xyz, self.coord_dp_postquant_nbits)
         grouped_features = grouping_operation(features, idx) if features is not None else None
         return grouped_xyz, grouped_features
 

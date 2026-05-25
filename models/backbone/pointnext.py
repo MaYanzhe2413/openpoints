@@ -135,6 +135,7 @@ class SetAbstraction(nn.Module):
         self.coord_sample_nbits = kwargs.get('coord_sample_nbits', 0)
         _coord_bq_nbits = kwargs.get('coord_bq_nbits', 0)
         _coord_dp_nbits = kwargs.get('coord_dp_nbits', 0)
+        _coord_dp_postquant_nbits = kwargs.get('coord_dp_postquant_nbits', 0)
         if not is_head:
             if self.all_aggr:
                 group_args.nsample = None
@@ -142,6 +143,7 @@ class SetAbstraction(nn.Module):
             self.grouper = create_grouper(group_args)
             self.grouper.coord_bq_nbits = _coord_bq_nbits
             self.grouper.coord_dp_nbits = _coord_dp_nbits
+            self.grouper.coord_dp_postquant_nbits = _coord_dp_postquant_nbits
             self.pool = MaxPool()
             self.qadd = QAdd()
             self.dequant_feat = quant.DeQuantStub()
@@ -433,6 +435,7 @@ class PointNextEncoder(nn.Module):
         self.coord_sample_nbits = kwargs.get('coord_sample_nbits', 0)
         self.coord_bq_nbits = kwargs.get('coord_bq_nbits', 0)
         self.coord_dp_nbits = kwargs.get('coord_dp_nbits', 0)
+        self.coord_dp_postquant_nbits = kwargs.get('coord_dp_postquant_nbits', 0)
         radius_scaling = kwargs.get('radius_scaling', 2)
         nsample_scaling = kwargs.get('nsample_scaling', 1)
 
@@ -463,9 +466,11 @@ class PointNextEncoder(nn.Module):
             logging.info(f'[CoordQuant] coordinates fake-quantized to {self.coord_nbits}-bit '
                          f'(per-sample, per-axis min/max)')
         # encoder fine-grained coord-quant ablation knobs (0 = FP32)
-        if (self.coord_sample_nbits or self.coord_bq_nbits or self.coord_dp_nbits):
+        if (self.coord_sample_nbits or self.coord_bq_nbits or self.coord_dp_nbits or
+                self.coord_dp_postquant_nbits):
             logging.info(f'[EncoderCoordQuant] sample_nbits={self.coord_sample_nbits}, '
-                         f'bq_nbits={self.coord_bq_nbits}, dp_nbits={self.coord_dp_nbits}')
+                         f'bq_nbits={self.coord_bq_nbits}, dp_nbits={self.coord_dp_nbits}, '
+                         f'dp_postquant_nbits={self.coord_dp_postquant_nbits}')
         self.channel_list = channels
 
     def _to_full_list(self, param, param_scaling=1):
@@ -504,6 +509,7 @@ class PointNextEncoder(nn.Module):
                                      coord_sample_nbits=self.coord_sample_nbits,
                                      coord_bq_nbits=self.coord_bq_nbits,
                                      coord_dp_nbits=self.coord_dp_nbits,
+                                     coord_dp_postquant_nbits=self.coord_dp_postquant_nbits,
                                      **self.aggr_args
                                      ))
         self.in_channels = channels
