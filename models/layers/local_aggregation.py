@@ -188,6 +188,8 @@ class ConvPool(nn.Module):
 
         self.grouper = create_grouper(group_args)
         self.reduction_layer = get_reduction_module(reduction)
+        self.identity_pool = MaxPool()
+        self.qadd = QAdd()
         self.dequant_feat = quant.DeQuantStub()
         self.quant_feat = quant.QuantStub()
 

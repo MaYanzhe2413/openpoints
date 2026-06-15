@@ -10,9 +10,11 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
+import torch.quantization as quant
 import logging
 from ..layers import furthest_point_sample, random_sample, kdtree_sample, LocalAggregation, three_interpolation, create_convblock1d # grid_subsampling,
 from ..layers.group import _fake_quant_xyz, QueryAndGroup
+from ..layers.quant_utils import QCat
 from ..build import MODELS
 
 
@@ -143,6 +145,10 @@ class PointNetFPModule(nn.Module):
                                             norm_args=norm_args, act_args=act_args,
                                             ))
         self.convs = nn.Sequential(*convs)
+        # PTQ boundaries: three_interpolation is an FP32 kernel; dequant before, quant after.
+        self.dequant_known = quant.DeQuantStub()
+        self.quant_interp = quant.QuantStub()
+        self.qcat = QCat(dim=1)
 
     def forward(
             self, unknown: torch.Tensor, known: torch.Tensor, unknow_feats: torch.Tensor, known_feats: torch.Tensor
@@ -156,14 +162,17 @@ class PointNetFPModule(nn.Module):
             new_features: (B, mlp[-1], n) tensor of the features of the unknown features
         """
         if known is not None:
+            # --- quant boundary: dequant before FP32 interpolation kernel, quant after ---
+            known_feats_f = self.dequant_known(known_feats)
             interpolated_feats = three_interpolation(
-                unknown, known, known_feats)
+                unknown, known, known_feats_f)
+            interpolated_feats = self.quant_interp(interpolated_feats)
         else:
             interpolated_feats = known_feats.expand(
                 *known_feats.size()[0:2], unknown.size(1))
         if unknow_feats is not None:
-            new_features = torch.cat(
-                [unknow_feats, interpolated_feats], dim=1)  # (B, C2 + C1, n)
+            new_features = self.qcat(
+                [unknow_feats, interpolated_feats])  # (B, C2 + C1, n)
         else:
             new_features = interpolated_feats
         new_features = self.convs(new_features)
@@ -324,6 +333,7 @@ class PointNet2Encoder(nn.Module):
             in_channels = channel_out
         self.out_channels = channel_out
         self.channel_list = skip_channel_list
+        self.quant_input = quant.QuantStub()   # PTQ: quantize input features at encoder entry
 
         # wire bq/dp coord-quant knobs into every ballquery grouper (QueryAndGroup
         # already reads these attributes, default 0). Single global setting across stages.
@@ -364,6 +374,7 @@ class PointNet2Encoder(nn.Module):
         xyz = self._fake_quant_coords(xyz)
         if features is None:
             features = xyz.clone().transpose(1, 2).contiguous()
+        features = self.quant_input(features)   # PTQ: FP32 -> uint8
         if self.stem_conv:
             features = self.conv1(features)
         if self.stem_aggr:
@@ -380,6 +391,7 @@ class PointNet2Encoder(nn.Module):
         if features is None:
             features = xyz.clone().transpose(1, 2).contiguous()
         xyz = xyz.contiguous()
+        features = self.quant_input(features)   # PTQ: FP32 -> uint8
         if self.stem_conv:
             features = self.conv1(features)
         if self.stem_aggr:
@@ -529,6 +541,9 @@ class PointNet2PartDecoder(nn.Module):
                 )
             )
         self.out_channels = fp_mlps[0][-1]
+        # PTQ: cls one-hot label is FP32; quantize it before concat with quantized features
+        self.quant_cls = quant.QuantStub()
+        self.qcat_cls = QCat(dim=1)
 
     def _to_full_list(self, param, blocks, param_scaling=1):
         # param can be: radius, nsample
@@ -559,8 +574,9 @@ class PointNet2PartDecoder(nn.Module):
         cls_one_hot = torch.zeros((B, 16), device=l_xyz[0].device)
         cls_one_hot = cls_one_hot.scatter_(
             1, cls_label, 1).unsqueeze(-1).repeat(1, 1, N)
+        cls_one_hot = self.quant_cls(cls_one_hot)   # PTQ: FP32 -> uint8
         l_features[0] = self.FP_modules[0](
-            l_xyz[0], l_xyz[1], torch.cat([cls_one_hot, l_features[0]], 1),
+            l_xyz[0], l_xyz[1], self.qcat_cls([cls_one_hot, l_features[0]]),
             l_features[1]
         )
         return l_features[0]
