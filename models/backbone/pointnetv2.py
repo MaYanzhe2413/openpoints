@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import logging
 from ..layers import furthest_point_sample, random_sample, kdtree_sample, LocalAggregation, three_interpolation, create_convblock1d # grid_subsampling,
+from ..layers.group import _fake_quant_xyz, QueryAndGroup
 from ..build import MODELS
 
 
@@ -43,31 +44,29 @@ class PointNetSAModuleMSG(nn.Module):
         self.stride = stride
         self.blocks = len(channel_list)
         self.query_as_support=query_as_support
+        # coord-quant ablation knob: quantize coords used for FPS index selection
+        self.coord_sample_nbits = kwargs.get('coord_sample_nbits', 0)
 
         # build the sampling layer:
         if 'fps' in sampler.lower() or 'furthest' in sampler.lower():
             self.sample_fn = furthest_point_sample
         elif 'random' in sampler.lower():
             self.sample_fn = random_sample
-        elif 'kdtree_simple' in sampler.lower():
-            # 简单KDTree叶节点随机/均匀采样，可通过 sampler_args 调整
-            try:
-                from functools import partial
-                from ..layers import kdtree_simple_sample, kdtree_sample
-                sampler_args = kwargs.get('sampler_args', {}) or {}
-                leaf_size = sampler_args.get('leaf_size', 32)
-                strategy = sampler_args.get('strategy', 'random')
-                proportional = sampler_args.get('proportional', True)
-                self.sample_fn = partial(kdtree_simple_sample,
-                                         leaf_size=leaf_size,
-                                         strategy=strategy,
-                                         proportional=proportional)
-            except ImportError:
-                logging.warning("Simple KDTree sampler import failed, falling back to standard KDTree")
-                from ..layers import kdtree_sample
-                self.sample_fn = kdtree_sample
         elif 'kdtree' in sampler.lower():
-            self.sample_fn = kdtree_sample
+            # KDTree leaf-local sampling (matches PointNeXt: any 'kdtree*' name maps
+            # to kdtree_simple_sample, configured via sampler_args).
+            from functools import partial
+            from ..layers import kdtree_simple_sample
+            sampler_args = kwargs.get('sampler_args', {}) or {}
+            leaf_size = sampler_args.get('leaf_size', 32)
+            strategy = sampler_args.get('strategy', 'fps')
+            proportional = sampler_args.get('proportional', True)
+            axis_strategy = sampler_args.get('axis_strategy', 'cycle')
+            self.sample_fn = partial(kdtree_simple_sample,
+                                     leaf_size=leaf_size,
+                                     strategy=strategy,
+                                     proportional=proportional,
+                                     axis_strategy=axis_strategy)
         else:
             # 默认使用FPS
             print(f"Unknown sampler '{sampler}', defaulting to FPS")
@@ -103,8 +102,10 @@ class PointNetSAModuleMSG(nn.Module):
         """
         new_features_list = []
         if query_xyz is None and self.stride > 1:
+            # quantize coords for sampling index selection only; gather uses raw coords
+            xyz_for_sample = _fake_quant_xyz(support_xyz, self.coord_sample_nbits)
             idx = self.sample_fn(
-                support_xyz, support_xyz.shape[1] // self.stride).long()
+                xyz_for_sample, support_xyz.shape[1] // self.stride).long()
             query_xyz = torch.gather(
                 support_xyz, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
         else:
@@ -224,9 +225,23 @@ class PointNet2Encoder(nn.Module):
                  **kwargs
                  ):
         super().__init__()
+        # coord-quant ablation knobs + sampler_args (pop before the unused-kwargs warning
+        # so they are actually consumed, not silently dropped)
+        self._coord_sample_nbits = kwargs.pop('coord_sample_nbits', 0)
+        self._coord_bq_nbits = kwargs.pop('coord_bq_nbits', 0)
+        self._coord_dp_nbits = kwargs.pop('coord_dp_nbits', 0)
+        self._coord_dp_postquant_nbits = kwargs.pop('coord_dp_postquant_nbits', 0)
+        self.coord_nbits = kwargs.pop('coord_nbits', 0)   # global input coord quant
+        sampler_args = kwargs.pop('sampler_args', {}) or {}
         if kwargs:
             logging.warning(
                 f"kwargs: {kwargs} are not used in {__class__.__name__}")
+        if (self._coord_sample_nbits or self._coord_bq_nbits or self._coord_dp_nbits
+                or self._coord_dp_postquant_nbits or self.coord_nbits):
+            logging.info(f'[PN2 CoordQuant] sample={self._coord_sample_nbits}, '
+                         f'bq={self._coord_bq_nbits}, dp={self._coord_dp_nbits}, '
+                         f'dp_postquant={self._coord_dp_postquant_nbits}, '
+                         f'input={self.coord_nbits}')
         stages = len(strides)
         self.strides = strides
         self.blocks = blocks if mlps is None else [len(mlp) for mlp in mlps]
@@ -300,13 +315,24 @@ class PointNet2Encoder(nn.Module):
                     act_args=act_args,
                     sampler=sampler,
                     use_res=use_res,
-                    query_as_support=query_as_support
+                    query_as_support=query_as_support,
+                    sampler_args=sampler_args,
+                    coord_sample_nbits=self._coord_sample_nbits,
                 )
             )
             skip_channel_list.append(channel_out)
             in_channels = channel_out
         self.out_channels = channel_out
         self.channel_list = skip_channel_list
+
+        # wire bq/dp coord-quant knobs into every ballquery grouper (QueryAndGroup
+        # already reads these attributes, default 0). Single global setting across stages.
+        if self._coord_bq_nbits or self._coord_dp_nbits or self._coord_dp_postquant_nbits:
+            for m in self.modules():
+                if isinstance(m, QueryAndGroup):
+                    m.coord_bq_nbits = self._coord_bq_nbits
+                    m.coord_dp_nbits = self._coord_dp_nbits
+                    m.coord_dp_postquant_nbits = self._coord_dp_postquant_nbits
 
     def _to_full_list(self, param, blocks, param_scaling=1, block_param_scaling=1):
         # param can be: radius, nsample
@@ -328,9 +354,14 @@ class PointNet2Encoder(nn.Module):
                     param *= param_scaling
         return param_list
 
+    def _fake_quant_coords(self, p):
+        """Optional global input-coordinate fake-quant (mirror PointNextEncoder)."""
+        return _fake_quant_xyz(p, self.coord_nbits)
+
     def forward_cls_feat(self, xyz, features=None):
         if hasattr(xyz, 'keys'):
             xyz, features = xyz['pos'], xyz['x']
+        xyz = self._fake_quant_coords(xyz)
         if features is None:
             features = xyz.clone().transpose(1, 2).contiguous()
         if self.stem_conv:
@@ -345,6 +376,7 @@ class PointNet2Encoder(nn.Module):
     def forward_seg_feat(self, xyz, features=None):
         if hasattr(xyz, 'keys'):
             xyz, features = xyz['pos'], xyz['x']
+        xyz = self._fake_quant_coords(xyz)
         if features is None:
             features = xyz.clone().transpose(1, 2).contiguous()
         xyz = xyz.contiguous()
