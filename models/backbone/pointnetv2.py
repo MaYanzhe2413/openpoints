@@ -13,7 +13,8 @@ import torch.nn as nn
 import torch.quantization as quant
 import logging
 from ..layers import furthest_point_sample, random_sample, kdtree_sample, LocalAggregation, three_interpolation, create_convblock1d # grid_subsampling,
-from ..layers.group import _fake_quant_xyz, QueryAndGroup
+from ..layers.group import _fake_quant_xyz, GroupAll, QueryAndGroup
+from ..layers.kdpoint_geometry import isotropic_q9_encode, q9_main_codes
 from ..layers.quant_utils import QCat
 from ..build import MODELS
 
@@ -48,6 +49,7 @@ class PointNetSAModuleMSG(nn.Module):
         self.query_as_support=query_as_support
         # coord-quant ablation knob: quantize coords used for FPS index selection
         self.coord_sample_nbits = kwargs.get('coord_sample_nbits', 0)
+        self.coord_hardware_exact = kwargs.get('coord_hardware_exact', False)
 
         # build the sampling layer:
         if 'fps' in sampler.lower() or 'furthest' in sampler.lower():
@@ -105,7 +107,14 @@ class PointNetSAModuleMSG(nn.Module):
         new_features_list = []
         if query_xyz is None and self.stride > 1:
             # quantize coords for sampling index selection only; gather uses raw coords
-            xyz_for_sample = _fake_quant_xyz(support_xyz, self.coord_sample_nbits)
+            if self.coord_hardware_exact:
+                xyz_for_sample = q9_main_codes(support_xyz).to(
+                    dtype=support_xyz.dtype
+                )
+            else:
+                xyz_for_sample = _fake_quant_xyz(
+                    support_xyz, self.coord_sample_nbits
+                )
             idx = self.sample_fn(
                 xyz_for_sample, support_xyz.shape[1] // self.stride).long()
             query_xyz = torch.gather(
@@ -133,11 +142,13 @@ class PointNetFPModule(nn.Module):
     def __init__(self, mlp: List[int],
                  norm_args={'norm': 'bn1d'},
                  act_args={'act': 'relu'},
+                 coord_hardware_exact=False,
                  ):
         """
         :param mlp: list of channel sizes
         """
         super().__init__()
+        self.coord_hardware_exact = coord_hardware_exact
         # Local Aggregations or Not
         convs = []
         for i in range(len(mlp) - 1):
@@ -165,7 +176,8 @@ class PointNetFPModule(nn.Module):
             # --- quant boundary: dequant before FP32 interpolation kernel, quant after ---
             known_feats_f = self.dequant_known(known_feats)
             interpolated_feats = three_interpolation(
-                unknown, known, known_feats_f)
+                unknown, known, known_feats_f,
+                hardware_exact=self.coord_hardware_exact)
             interpolated_feats = self.quant_interp(interpolated_feats)
         else:
             interpolated_feats = known_feats.expand(
@@ -240,6 +252,7 @@ class PointNet2Encoder(nn.Module):
         self._coord_bq_nbits = kwargs.pop('coord_bq_nbits', 0)
         self._coord_dp_nbits = kwargs.pop('coord_dp_nbits', 0)
         self._coord_dp_postquant_nbits = kwargs.pop('coord_dp_postquant_nbits', 0)
+        self.coord_hardware_exact = kwargs.pop('coord_hardware_exact', False)
         self.coord_nbits = kwargs.pop('coord_nbits', 0)   # global input coord quant
         sampler_args = kwargs.pop('sampler_args', {}) or {}
         if kwargs:
@@ -251,6 +264,10 @@ class PointNet2Encoder(nn.Module):
                          f'bq={self._coord_bq_nbits}, dp={self._coord_dp_nbits}, '
                          f'dp_postquant={self._coord_dp_postquant_nbits}, '
                          f'input={self.coord_nbits}')
+        if self.coord_hardware_exact:
+            logging.info(
+                '[KDPointGeometry] PN2 isotropic q9 input with encoder sidecar'
+            )
         stages = len(strides)
         self.strides = strides
         self.blocks = blocks if mlps is None else [len(mlp) for mlp in mlps]
@@ -327,6 +344,7 @@ class PointNet2Encoder(nn.Module):
                     query_as_support=query_as_support,
                     sampler_args=sampler_args,
                     coord_sample_nbits=self._coord_sample_nbits,
+                    coord_hardware_exact=self.coord_hardware_exact,
                 )
             )
             skip_channel_list.append(channel_out)
@@ -337,12 +355,16 @@ class PointNet2Encoder(nn.Module):
 
         # wire bq/dp coord-quant knobs into every ballquery grouper (QueryAndGroup
         # already reads these attributes, default 0). Single global setting across stages.
-        if self._coord_bq_nbits or self._coord_dp_nbits or self._coord_dp_postquant_nbits:
+        if (self._coord_bq_nbits or self._coord_dp_nbits or
+                self._coord_dp_postquant_nbits or self.coord_hardware_exact):
             for m in self.modules():
+                if isinstance(m, (QueryAndGroup, GroupAll)):
+                    m.coord_hardware_exact = self.coord_hardware_exact
                 if isinstance(m, QueryAndGroup):
                     m.coord_bq_nbits = self._coord_bq_nbits
                     m.coord_dp_nbits = self._coord_dp_nbits
                     m.coord_dp_postquant_nbits = self._coord_dp_postquant_nbits
+                    m.coord_hardware_exact = self.coord_hardware_exact
 
     def _to_full_list(self, param, blocks, param_scaling=1, block_param_scaling=1):
         # param can be: radius, nsample
@@ -368,12 +390,28 @@ class PointNet2Encoder(nn.Module):
         """Optional global input-coordinate fake-quant (mirror PointNextEncoder)."""
         return _fake_quant_xyz(p, self.coord_nbits)
 
+    def _prepare_coords(self, p):
+        if not self.coord_hardware_exact:
+            quantized = self._fake_quant_coords(p)
+            return quantized, quantized
+        codes, dequantized, step = isotropic_q9_encode(p)
+        origin = p.to(dtype=torch.float64).amin(dim=1, keepdim=True)
+        for module in self.modules():
+            if isinstance(module, QueryAndGroup):
+                module.coord_hardware_exact = True
+                module.coord_step = step
+            elif isinstance(module, GroupAll):
+                module.coord_hardware_exact = True
+                module.coord_step = step
+                module.coord_origin = origin
+        return codes.to(dtype=p.dtype), dequantized
+
     def forward_cls_feat(self, xyz, features=None):
         if hasattr(xyz, 'keys'):
             xyz, features = xyz['pos'], xyz['x']
-        xyz = self._fake_quant_coords(xyz)
+        xyz, feature_coords = self._prepare_coords(xyz)
         if features is None:
-            features = xyz.clone().transpose(1, 2).contiguous()
+            features = feature_coords.transpose(1, 2).contiguous()
         features = self.quant_input(features)   # PTQ: FP32 -> uint8
         if self.stem_conv:
             features = self.conv1(features)
@@ -387,9 +425,9 @@ class PointNet2Encoder(nn.Module):
     def forward_seg_feat(self, xyz, features=None):
         if hasattr(xyz, 'keys'):
             xyz, features = xyz['pos'], xyz['x']
-        xyz = self._fake_quant_coords(xyz)
+        xyz, feature_coords = self._prepare_coords(xyz)
         if features is None:
-            features = xyz.clone().transpose(1, 2).contiguous()
+            features = feature_coords.transpose(1, 2).contiguous()
         xyz = xyz.contiguous()
         features = self.quant_input(features)   # PTQ: FP32 -> uint8
         if self.stem_conv:
@@ -423,6 +461,7 @@ class PointNet2Decoder(nn.Module):
                  **kwargs
                  ):
         super().__init__()
+        self.coord_hardware_exact = kwargs.get('coord_hardware_exact', False)
         skip_channel_list = encoder_channel_list
         self.FP_modules = nn.ModuleList()
         if fp_mlps is None:
@@ -434,7 +473,8 @@ class PointNet2Decoder(nn.Module):
                 else skip_channel_list[-1]
             self.FP_modules.append(
                 PointNetFPModule(
-                    [pre_channel + skip_channel_list[k]] + fp_mlps[k]
+                    [pre_channel + skip_channel_list[k]] + fp_mlps[k],
+                    coord_hardware_exact=self.coord_hardware_exact,
                 )
             )
         self.out_channels = fp_mlps[0][-1]
@@ -476,6 +516,7 @@ class PointNet2PartDecoder(nn.Module):
                  **kwargs
                  ):
         super().__init__()
+        self.coord_hardware_exact = kwargs.pop('coord_hardware_exact', False)
         if kwargs:
             logging.warning(
                 f"kwargs: {kwargs} are not used in {__class__.__name__}")
@@ -538,6 +579,7 @@ class PointNet2PartDecoder(nn.Module):
             self.FP_modules.append(
                 PointNetFPModule(
                     [pre_channel + skip_channel_list[k]] + fp_mlps[k],
+                    coord_hardware_exact=self.coord_hardware_exact,
                 )
             )
         self.out_channels = fp_mlps[0][-1]

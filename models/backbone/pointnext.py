@@ -11,7 +11,8 @@ import torch.quantization as quant
 from ..build import MODELS
 from ..layers import create_convblock1d, create_convblock2d, create_act, CHANNEL_MAP, \
     create_grouper, furthest_point_sample, random_sample, three_interpolation, get_aggregation_feautres, kdtree_sample
-from ..layers.group import _fake_quant_xyz
+from ..layers.group import _fake_quant_xyz, GroupAll, QueryAndGroup
+from ..layers.kdpoint_geometry import isotropic_q9_encode, q9_main_codes
 from ..layers.quant_utils import (
     MaxPool, MeanPool, SumPool,
     get_reduction_module, QAdd, QCat,
@@ -133,6 +134,7 @@ class SetAbstraction(nn.Module):
         self.convs = nn.Sequential(*convs)
         # encoder coord-quant ablation knobs (0 = FP32, original behaviour)
         self.coord_sample_nbits = kwargs.get('coord_sample_nbits', 0)
+        self.coord_hardware_exact = kwargs.get('coord_hardware_exact', False)
         _coord_bq_nbits = kwargs.get('coord_bq_nbits', 0)
         _coord_dp_nbits = kwargs.get('coord_dp_nbits', 0)
         _coord_dp_postquant_nbits = kwargs.get('coord_dp_postquant_nbits', 0)
@@ -144,6 +146,7 @@ class SetAbstraction(nn.Module):
             self.grouper.coord_bq_nbits = _coord_bq_nbits
             self.grouper.coord_dp_nbits = _coord_dp_nbits
             self.grouper.coord_dp_postquant_nbits = _coord_dp_postquant_nbits
+            self.grouper.coord_hardware_exact = self.coord_hardware_exact
             self.pool = MaxPool()
             self.qadd = QAdd()
             self.dequant_feat = quant.DeQuantStub()
@@ -177,7 +180,10 @@ class SetAbstraction(nn.Module):
             if not self.all_aggr:
                 # sampling uses sample-precision coords for index selection;
                 # the gathered query points keep their original (FP32) values
-                p_sample = _fake_quant_xyz(p, self.coord_sample_nbits)
+                if self.coord_hardware_exact:
+                    p_sample = q9_main_codes(p).to(dtype=p.dtype)
+                else:
+                    p_sample = _fake_quant_xyz(p, self.coord_sample_nbits)
                 idx = self.sample_fn(p_sample, p.shape[1] // self.stride).long()
                 new_p = torch.gather(p, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
             else:
@@ -219,6 +225,7 @@ class FeaturePropogation(nn.Module):
                  coord_knn_nbits=0,
                  coord_weight_nbits=0,
                  coord_topk=0,
+                 coord_hardware_exact=False,
                  ):
         """
         Args:
@@ -233,6 +240,7 @@ class FeaturePropogation(nn.Module):
         self.coord_knn_nbits = coord_knn_nbits
         self.coord_weight_nbits = coord_weight_nbits
         self.coord_topk = coord_topk
+        self.coord_hardware_exact = coord_hardware_exact
         if not upsample:
             self.linear2 = nn.Sequential(
                 nn.Linear(mlp[0], mlp[1]), nn.ReLU(inplace=True))
@@ -272,7 +280,8 @@ class FeaturePropogation(nn.Module):
             interp = three_interpolation(p1, p2, f2_float,
                                          knn_nbits=self.coord_knn_nbits,
                                          weight_nbits=self.coord_weight_nbits,
-                                         topk=self.coord_topk)
+                                         topk=self.coord_topk,
+                                         hardware_exact=self.coord_hardware_exact)
             interp_q = self.quant_interp(interp)
             if f1 is not None:
                 f = self.convs(self.qcat([f1, interp_q]))
@@ -436,6 +445,7 @@ class PointNextEncoder(nn.Module):
         self.coord_bq_nbits = kwargs.get('coord_bq_nbits', 0)
         self.coord_dp_nbits = kwargs.get('coord_dp_nbits', 0)
         self.coord_dp_postquant_nbits = kwargs.get('coord_dp_postquant_nbits', 0)
+        self.coord_hardware_exact = kwargs.get('coord_hardware_exact', False)
         radius_scaling = kwargs.get('radius_scaling', 2)
         nsample_scaling = kwargs.get('nsample_scaling', 1)
 
@@ -465,6 +475,11 @@ class PointNextEncoder(nn.Module):
         if self.coord_nbits and self.coord_nbits > 0:
             logging.info(f'[CoordQuant] coordinates fake-quantized to {self.coord_nbits}-bit '
                          f'(per-sample, per-axis min/max)')
+        if self.coord_hardware_exact:
+            logging.info(
+                '[KDPointGeometry] isotropic q9 input; q8 main for FPS/KD/decoder, '
+                'q9 main+sidecar for encoder BQ/dp'
+            )
         # encoder fine-grained coord-quant ablation knobs (0 = FP32)
         if (self.coord_sample_nbits or self.coord_bq_nbits or self.coord_dp_nbits or
                 self.coord_dp_postquant_nbits):
@@ -510,6 +525,7 @@ class PointNextEncoder(nn.Module):
                                      coord_bq_nbits=self.coord_bq_nbits,
                                      coord_dp_nbits=self.coord_dp_nbits,
                                      coord_dp_postquant_nbits=self.coord_dp_postquant_nbits,
+                                     coord_hardware_exact=self.coord_hardware_exact,
                                      **self.aggr_args
                                      ))
         self.in_channels = channels
@@ -536,12 +552,28 @@ class PointNextEncoder(nn.Module):
         q = torch.round((p - p_min) / scale)
         return q * scale + p_min
 
+    def _prepare_coords(self, p):
+        if not self.coord_hardware_exact:
+            quantized = self._fake_quant_coords(p)
+            return quantized, quantized
+        codes, dequantized, step = isotropic_q9_encode(p)
+        origin = p.to(dtype=torch.float64).amin(dim=1, keepdim=True)
+        for module in self.modules():
+            if isinstance(module, QueryAndGroup):
+                module.coord_hardware_exact = True
+                module.coord_step = step
+            elif isinstance(module, GroupAll):
+                module.coord_hardware_exact = True
+                module.coord_step = step
+                module.coord_origin = origin
+        return codes.to(dtype=p.dtype), dequantized
+
     def forward_cls_feat(self, p0, f0=None):
         if hasattr(p0, 'keys'):
             p0, f0 = p0['pos'], p0.get('x', None)
-        p0 = self._fake_quant_coords(p0)
+        p0, feature_coords = self._prepare_coords(p0)
         if f0 is None:
-            f0 = p0.clone().transpose(1, 2).contiguous()
+            f0 = feature_coords.transpose(1, 2).contiguous()
         f0 = self.quant_input(f0)
         for i in range(0, len(self.encoder)):
             p0, f0 = self.encoder[i]([p0, f0])
@@ -550,9 +582,9 @@ class PointNextEncoder(nn.Module):
     def forward_seg_feat(self, p0, f0=None):
         if hasattr(p0, 'keys'):
             p0, f0 = p0['pos'], p0.get('x', None)
-        p0 = self._fake_quant_coords(p0)
+        p0, feature_coords = self._prepare_coords(p0)
         if f0 is None:
-            f0 = p0.clone().transpose(1, 2).contiguous()
+            f0 = feature_coords.transpose(1, 2).contiguous()
         f0 = self.quant_input(f0)
         p, f = [p0], [f0]
         for i in range(0, len(self.encoder)):
@@ -585,6 +617,7 @@ class PointNextDecoder(nn.Module):
         self.coord_knn_nbits = kwargs.get('coord_knn_nbits', 0)
         self.coord_weight_nbits = kwargs.get('coord_weight_nbits', 0)
         self.coord_topk = kwargs.get('coord_topk', 0)
+        self.coord_hardware_exact = kwargs.get('coord_hardware_exact', False)
         if self.coord_knn_nbits or self.coord_weight_nbits or self.coord_topk:
             logging.info(f'[DecoderCoordQuant] three_interpolation: '
                          f'knn_nbits={self.coord_knn_nbits}, '
@@ -606,7 +639,8 @@ class PointNextDecoder(nn.Module):
         layers.append(FeaturePropogation(mlp,
                                          coord_knn_nbits=self.coord_knn_nbits,
                                          coord_weight_nbits=self.coord_weight_nbits,
-                                         coord_topk=self.coord_topk))
+                                         coord_topk=self.coord_topk,
+                                         coord_hardware_exact=self.coord_hardware_exact))
         self.in_channels = fp_channels
         return nn.Sequential(*layers)
 
@@ -632,6 +666,7 @@ class PointNextPartDecoder(nn.Module):
                  ):
         super().__init__()
         self.decoder_layers = decoder_layers
+        self.coord_hardware_exact = kwargs.get('coord_hardware_exact', False)
         self.in_channels = encoder_channel_list[-1]
         skip_channels = encoder_channel_list[:-1]
         fp_channels = encoder_channel_list[:-1]
@@ -711,7 +746,10 @@ class PointNextPartDecoder(nn.Module):
         nsample = group_args.nsample
         mlp = [skip_channels + self.in_channels] + \
               [fp_channels] * self.decoder_layers
-        layers.append(FeaturePropogation(mlp, act_args=self.act_args))
+        layers.append(FeaturePropogation(
+            mlp, act_args=self.act_args,
+            coord_hardware_exact=self.coord_hardware_exact,
+        ))
         self.in_channels = fp_channels
         for i in range(1, blocks):
             group_args.radius = radii[i]
@@ -720,7 +758,7 @@ class PointNextPartDecoder(nn.Module):
                                 aggr_args=self.aggr_args,
                                 norm_args=self.norm_args, act_args=self.act_args, group_args=group_args,
                                 conv_args=self.conv_args, expansion=self.expansion,
-                                use_res=self.use_res
+                                use_res=self.use_res,
                                 ))
         return nn.Sequential(*layers)
 

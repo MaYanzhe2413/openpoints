@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from openpoints.cpp.pointnet2_batch import pointnet2_cuda
 from openpoints.models.layers import create_convblock1d
+from .kdpoint_geometry import q9_main_codes, wfu_weights_exact_tensor
 
 
 class ThreeNN(Function):
@@ -108,7 +109,8 @@ def _fake_quant_xyz(p, nbits):
 
 
 def three_interpolation(unknown_xyz, known_xyz, know_feat,
-                        knn_nbits=0, weight_nbits=0, topk=0):
+                        knn_nbits=0, weight_nbits=0, topk=0,
+                        hardware_exact=False):
     """
     input: known_xyz: (m, 3), unknown_xyz: (n, 3), feat: (m, c), offset: (b), new_offset: (b)
     output: (n, c)
@@ -119,6 +121,27 @@ def three_interpolation(unknown_xyz, known_xyz, know_feat,
         topk        : if >3, select topk candidates with knn_nbits coords,
                       then refine to top3 with weight_nbits coords
     """
+    if hardware_exact:
+        unknown_main = q9_main_codes(unknown_xyz).to(
+            dtype=unknown_xyz.dtype
+        ).contiguous()
+        known_main = q9_main_codes(known_xyz).to(
+            dtype=known_xyz.dtype
+        ).contiguous()
+        _, idx = three_nn(unknown_main, known_main)
+        batch_size, n_fine, _ = unknown_main.shape
+        neighbors = torch.gather(
+            known_main.unsqueeze(1).expand(batch_size, n_fine, -1, -1), 2,
+            idx.long().unsqueeze(-1).expand(-1, -1, -1, 3),
+        )
+        delta = neighbors.to(torch.int64) - unknown_main.to(
+            torch.int64
+        ).unsqueeze(2)
+        distances_sq = delta.square().sum(dim=-1)
+        weight_codes = wfu_weights_exact_tensor(distances_sq)
+        weight = (weight_codes.to(dtype=know_feat.dtype) / 128.0).contiguous()
+        return three_interpolate(know_feat, idx.contiguous(), weight)
+
     # original fast path
     if knn_nbits <= 0 and weight_nbits <= 0 and topk <= 0:
         dist, idx = three_nn(unknown_xyz, known_xyz)

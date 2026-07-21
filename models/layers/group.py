@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch.autograd import Function
 from openpoints.cpp import pointnet2_cuda
+from .kdpoint_geometry import dp_requantize_q9, strict_ball_query
 
 class KNN(nn.Module):
     def __init__(self, neighbors, transpose_mode=True):
@@ -270,6 +271,9 @@ class QueryAndGroup(nn.Module):
         self.coord_bq_nbits = kwargs.get('coord_bq_nbits', 0)   # ball_query neighbour selection
         self.coord_dp_nbits = kwargs.get('coord_dp_nbits', 0)   # dp relative position (source coords)
         self.coord_dp_postquant_nbits = kwargs.get('coord_dp_postquant_nbits', 0)  # dp after /radius
+        self.coord_hardware_exact = kwargs.get('coord_hardware_exact', False)
+        self.coord_step = None
+        self.coord_dp_qparams = None
 
     def forward(self, query_xyz: torch.Tensor, support_xyz: torch.Tensor, features: torch.Tensor = None) -> Tuple[
         torch.Tensor]:
@@ -280,10 +284,18 @@ class QueryAndGroup(nn.Module):
         :return:
             new_features: (B, 3 + C, npoint, nsample)
         """
-        # ball_query neighbour selection with bq-precision coords
-        s_bq = _fake_quant_xyz(support_xyz, self.coord_bq_nbits).contiguous()
-        q_bq = _fake_quant_xyz(query_xyz, self.coord_bq_nbits).contiguous()
-        idx = ball_query(self.radius, self.nsample, s_bq, q_bq)
+        if self.coord_hardware_exact:
+            if self.coord_step is None:
+                raise RuntimeError("hardware geometry requires a per-cloud q9 step")
+            idx = strict_ball_query(
+                ball_query, self.radius, self.nsample,
+                support_xyz, query_xyz, self.coord_step,
+            )
+        else:
+            # ball_query neighbour selection with bq-precision coords
+            s_bq = _fake_quant_xyz(support_xyz, self.coord_bq_nbits).contiguous()
+            q_bq = _fake_quant_xyz(query_xyz, self.coord_bq_nbits).contiguous()
+            idx = ball_query(self.radius, self.nsample, s_bq, q_bq)
 
         logger = getattr(self, "_neighbor_logger", None)
         if logger is not None:
@@ -292,16 +304,36 @@ class QueryAndGroup(nn.Module):
         if self.return_only_idx:
             return idx
         # dp relative position with dp-precision coords
-        s_dp = _fake_quant_xyz(support_xyz, self.coord_dp_nbits)
-        q_dp = _fake_quant_xyz(query_xyz, self.coord_dp_nbits)
+        if self.coord_hardware_exact:
+            s_dp, q_dp = support_xyz, query_xyz
+        else:
+            s_dp = _fake_quant_xyz(support_xyz, self.coord_dp_nbits)
+            q_dp = _fake_quant_xyz(query_xyz, self.coord_dp_nbits)
         xyz_trans = s_dp.transpose(1, 2).contiguous()
         grouped_xyz = grouping_operation(xyz_trans, idx)  # (B, 3, npoint, nsample)
         if self.relative_xyz:
             grouped_xyz = grouped_xyz - q_dp.transpose(1, 2).unsqueeze(-1)  # relative position
-            if self.normalize_dp:
-                grouped_xyz /= self.radius
-            # post-normalize dp quantization (simulates hardware uint8 quant of dp_norm in [-1, +1])
-            grouped_xyz = _fake_quant_dp_norm(grouped_xyz, self.coord_dp_postquant_nbits)
+            if self.coord_hardware_exact:
+                if self.coord_dp_qparams is None:
+                    step = self.coord_step.to(
+                        device=grouped_xyz.device, dtype=grouped_xyz.dtype
+                    ).reshape(grouped_xyz.shape[0], 1, 1, 1)
+                    grouped_xyz = grouped_xyz * step
+                    if self.normalize_dp:
+                        grouped_xyz /= self.radius
+                else:
+                    target_scale, target_zero_point = self.coord_dp_qparams
+                    grouped_xyz = dp_requantize_q9(
+                        grouped_xyz, self.coord_step, self.radius,
+                        target_scale, target_zero_point, self.normalize_dp,
+                    ).to(device=grouped_xyz.device, dtype=grouped_xyz.dtype)
+            else:
+                if self.normalize_dp:
+                    grouped_xyz /= self.radius
+                # Simulate the post-normalize uint8 dp quantization ablation.
+                grouped_xyz = _fake_quant_dp_norm(
+                    grouped_xyz, self.coord_dp_postquant_nbits
+                )
         grouped_features = grouping_operation(features, idx) if features is not None else None
         return grouped_xyz, grouped_features
 
@@ -309,6 +341,9 @@ class QueryAndGroup(nn.Module):
 class GroupAll(nn.Module):
     def __init__(self, ):
         super().__init__()
+        self.coord_hardware_exact = False
+        self.coord_step = None
+        self.coord_origin = None
 
     def forward(self, new_xyz: torch.Tensor, xyz: torch.Tensor, features: torch.Tensor = None):
         """
@@ -318,6 +353,15 @@ class GroupAll(nn.Module):
         :return:
             new_features: (B, C + 3, 1, N)
         """
+        if self.coord_hardware_exact:
+            if self.coord_step is None or self.coord_origin is None:
+                raise RuntimeError(
+                    "hardware geometry GroupAll requires scene origin and step"
+                )
+            work = xyz.to(dtype=torch.float64)
+            step = self.coord_step.to(device=xyz.device, dtype=torch.float64)
+            origin = self.coord_origin.to(device=xyz.device, dtype=torch.float64)
+            xyz = (work * step + origin).to(dtype=xyz.dtype)
         grouped_xyz = xyz.transpose(1, 2).unsqueeze(2)
         grouped_features = features.unsqueeze(2) if features is not None else None
         return grouped_xyz, grouped_features
